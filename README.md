@@ -1,106 +1,87 @@
 # Agent Delegation Link
 
-Agent Delegation Link (`adl`) lets one user's Codex or Claude Code send a scoped coding task to another user's local agent through one revocable URL. Both users make outbound connections, so they can be on different networks and behind NAT.
+Agent Delegation Link (`adl`) lets one user's Codex or Claude Code send a scoped coding task to another user's local agent through one revocable URL.
 
-The project is now a **trusted-collaborator alpha**. It is ready for controlled tests with people you know, on non-sensitive repositories. It is not yet a safe boundary for anonymous users or hostile codebases; read [SECURITY.md](SECURITY.md) first.
+Both machines connect outward to an HTTPS/WSS Relay, so they can be on different networks and behind NAT: `sender agent -> encrypted Relay <- owner agent`.
 
-## The core difference
+> [!WARNING]
+> This is a trusted-collaborator alpha for non-sensitive repositories. Read [SECURITY.md](SECURITY.md) before testing.
 
-Most multi-agent tools coordinate agents owned by one user, in one process or shared workspace. ADL treats the other person's agent as a remote, task-scoped capability:
+## Install
 
-```text
-sender Codex/Claude -> ADL CLI or MCP -> HTTPS relay <- owner gateway -> owner Codex/Claude
-```
-
-- one link connects users across networks;
-- the owner chooses repository, agent, permissions, expiry, task count, time limit, and validation commands;
-- the relay routes end-to-end encrypted envelopes and cannot read the goal, progress, result, or patch;
-- every task runs in a disposable Git worktree, and the result is a patch rather than a direct edit to the owner's checkout;
-- owner approval is required by default.
-
-## Alpha features
-
-- Codex CLI, Claude Code, and deterministic fake adapters
-- MCP tools: `delegate_task` and `get_task`
-- AES-256-GCM end-to-end encryption with HKDF-separated relay and content keys
-- expiring, revocable, task-counted capability links
-- per-task approval, permission checks at relay and gateway, and owner-defined validation
-- edit tasks fail closed when no patch is produced, and nonzero owner validations fail the task
-- execution timeout, output/patch limits, request rate limiting, and optional relay registration token
-- reconnect, encrypted offline queueing, and idempotent retry protection
-- hash-chained local JSONL audit log without task or patch plaintext
-- Docker/Caddy HTTPS relay deployment and CI
-
-## Install from source
-
-Requirements: Node.js 22+, Git, and an authenticated Codex or Claude Code CLI on the repository owner's machine.
+Requires Node.js 22+, Git, and an authenticated Codex or Claude Code CLI on the machine that executes tasks.
 
 ```bash
-npm ci
-npm run check
-npm test
-npm run build
-npm pack
-npm install -g ./agent-delegation-link-0.2.0-alpha.2.tgz
+npm install -g https://github.com/jszzr/agent-delegation-link/releases/download/v0.2.0-alpha.2/agent-delegation-link-0.2.0-alpha.2.tgz
+adl --version
 ```
 
-## Local smoke test
+## Two-machine quick start
 
-Terminal 1:
+Suppose user A sends a task to user B's agent. The Relay operator gives B the Relay URL and registration token; A does not need the token.
 
-```bash
-adl relay
-```
-
-Terminal 2:
+On B's machine, share a clean test repository:
 
 ```bash
+read -s ADL_RELAY_TOKEN
+export ADL_RELAY_TOKEN
+
 adl share \
-  --agent fake \
-  --repo . \
+  --agent codex \
+  --repo /absolute/path/to/test-repo \
+  --relay https://relay.example.com \
+  --relay-token-env ADL_RELAY_TOKEN \
   --permissions read,edit,test \
-  --approval auto_within_scope \
   --validate "npm test"
 ```
 
-Terminal 3, after saving the printed full URL to a mode-600 file:
+The defaults are a 30-minute, one-task link with explicit approval. Use `--agent claude` for Claude Code. Send the complete invitation URL to A through an end-to-end encrypted channel.
+
+On A's machine, keep the link out of shell history and submit a task:
 
 ```bash
-adl invoke --link-file /tmp/adl-link \
-  --goal "Create a delegated-result file" \
+umask 077
+read -s ADL_LINK
+printf '%s\n' "$ADL_LINK" > /tmp/adl-link
+unset ADL_LINK
+
+adl invoke \
+  --link-file /tmp/adl-link \
+  --goal "Add a unit test for empty parser input" \
   --permissions read,edit,test \
-  --patch-file /tmp/delegated.patch
+  --patch-file /tmp/adl-result.patch
 ```
 
-`auto_within_scope` is explicit in this deterministic local demo. Omit it for real collaboration; `ask_every_time` is the default.
+B reviews and approves the task. A receives the patch and validation output. Run `git apply --check` before applying it.
 
-## Agent-native use through MCP
+Links are directional and task-scoped. Reverse the roles and create a new link for B to send a task to A.
 
-Install the stdio MCP server once:
+## Agent-to-agent use
+
+Register ADL once, then let the sender's agent call the `delegate_task` MCP tool:
 
 ```bash
 codex mcp add adl -- adl mcp
 claude mcp add --scope user adl -- adl mcp
 ```
 
-The sender's agent can then call `delegate_task` with an invitation URL, goal, requested permissions, constraints, and acceptance criteria. The full URL is a bearer secret and becomes visible to the sender's agent when used this way.
+The invitation URL becomes visible to that local agent session, so use a trusted machine.
 
-## Real two-user test
+## Safety
 
-Follow [docs/ALPHA_TEST.md](docs/ALPHA_TEST.md). It covers an HTTPS relay, operator registration token, owner approval, secure link handling, Codex/Claude combinations, patch review, audit verification, and teardown.
+- task content and patches are end-to-end encrypted; the Relay still sees routing metadata and traffic timing;
+- the owner controls scope and approval; tasks run in temporary Git worktrees and return patches;
+- links are bearer secrets, and no patch, failed validation, timeout, or out-of-scope permissions fail closed.
 
-## Development
+A worktree is not a complete OS sandbox. Linux owners must configure Codex's Bubblewrap/AppArmor sandbox and must not bypass failures with `danger-full-access`.
 
-```bash
-npm run check
-npm test
-npm run build
-npm run demo
-docker build -t adl-relay .
-```
+## More
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for protocol details and [SECURITY.md](SECURITY.md) for the threat model and remaining limitations.
+- [Two-user runbook](docs/ALPHA_TEST.md)
+- [Security model](SECURITY.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Latest prerelease](https://github.com/jszzr/agent-delegation-link/releases/tag/v0.2.0-alpha.2)
 
-## License
+Development: `npm ci && npm run check && npm test && npm run build`
 
-MIT
+MIT licensed.
