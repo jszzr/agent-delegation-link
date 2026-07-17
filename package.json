@@ -1,24 +1,35 @@
 {
   "name": "agent-delegation-link",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.2",
   "description": "Task-scoped delegation links for user-owned Codex and Claude Code agents.",
   "type": "module",
   "private": true,
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE",
+    "docs"
+  ],
   "bin": {
     "adl": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/cli.js",
     "check": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/cli.ts",
     "demo": "tsx examples/local-demo.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepack": "npm run build"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "commander": "^14.0.0",
     "ws": "^8.18.3",
     "zod": "^4.0.5"

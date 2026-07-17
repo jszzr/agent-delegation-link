@@ -1,41 +1,67 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
-import { createSecret, verifySecret } from "./capability.js";
+import { assertSecureRelayOrigin, createSecret, hashSecret, verifySecret } from "./capability.js";
 import {
   createGrantRequestSchema,
-  taskRequestSchema,
-  taskResultSchema,
-  type GatewayOutboundEvent,
+  gatewayOutboundEventSchema,
+  taskSubmissionSchema,
   type GrantPolicy,
-  type StoredTask,
-  type TaskRequest
+  type RelayStoredTask,
+  type TaskSubmission
 } from "./protocol.js";
 
 interface GrantRecord {
   id: string;
-  secretHash: string;
-  ownerToken: string;
+  relayCredentialHash: string;
+  ownerTokenHash: string;
   policy: GrantPolicy;
   acceptedTasks: number;
+  clientRequests: Map<string, string>;
   revoked: boolean;
 }
 
+interface RateBucket {
+  startedAt: number;
+  count: number;
+}
+
+interface LiveWebSocket extends WebSocket {
+  isAlive?: boolean;
+}
+
+class HttpError extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(message);
+  }
+}
+
+const JSON_HEADERS = {
+  "content-type": "application/json; charset=utf-8",
+  "cache-control": "no-store",
+  "x-content-type-options": "nosniff"
+};
+
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  if (response.headersSent) return;
+  response.writeHead(status, JSON_HEADERS);
   response.end(JSON.stringify(body));
 }
 
-async function readJson(request: IncomingMessage, maxBytes = 1_000_000): Promise<unknown> {
+async function readJson(request: IncomingMessage, maxBytes: number): Promise<unknown> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of request) {
     const buffer = Buffer.from(chunk);
     total += buffer.length;
-    if (total > maxBytes) throw new Error("Request body is too large");
+    if (total > maxBytes) throw new HttpError(413, "payload_too_large", "Request body is too large");
     chunks.push(buffer);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as unknown;
+  } catch {
+    throw new HttpError(400, "invalid_json", "Request body must be valid JSON");
+  }
 }
 
 function bearerToken(request: IncomingMessage): string | undefined {
@@ -43,64 +69,114 @@ function bearerToken(request: IncomingMessage): string | undefined {
   return value?.startsWith("Bearer ") ? value.slice(7) : undefined;
 }
 
+function samePermissions(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 export interface RelayAddress {
   origin: string;
   port: number;
 }
 
+export interface RelayStartOptions {
+  host?: string;
+  port?: number;
+  publicBaseUrl?: string;
+  maxRequestsPerMinute?: number;
+  trustProxy?: boolean;
+  registrationToken?: string;
+  onLog?: (message: string) => void;
+}
+
 export class RelayServer {
   private readonly grants = new Map<string, GrantRecord>();
-  private readonly tasks = new Map<string, StoredTask>();
-  private readonly gateways = new Map<string, WebSocket>();
+  private readonly tasks = new Map<string, RelayStoredTask>();
+  private readonly gateways = new Map<string, LiveWebSocket>();
+  private readonly rateBuckets = new Map<string, RateBucket>();
   private server: Server | undefined;
+  private websocketServer: WebSocketServer | undefined;
+  private heartbeat: NodeJS.Timeout | undefined;
   private publicBaseUrl: string | undefined;
+  private maxRequestsPerMinute = 120;
+  private trustProxy = false;
+  private registrationTokenHash: string | undefined;
+  private onLog: ((message: string) => void) | undefined;
 
-  async start(options: { host?: string; port?: number; publicBaseUrl?: string } = {}): Promise<RelayAddress> {
+  async start(options: RelayStartOptions = {}): Promise<RelayAddress> {
     if (this.server) throw new Error("Relay is already running");
     const host = options.host ?? "127.0.0.1";
+    this.maxRequestsPerMinute = options.maxRequestsPerMinute ?? 120;
+    this.trustProxy = options.trustProxy ?? false;
+    this.registrationTokenHash = options.registrationToken === undefined ? undefined : hashSecret(options.registrationToken);
+    this.onLog = options.onLog;
+    if (options.publicBaseUrl) assertSecureRelayOrigin(options.publicBaseUrl);
     this.server = createServer((request, response) => {
       void this.handleHttp(request, response).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        sendJson(response, 500, { error: "internal_error", message });
+        if (error instanceof HttpError) {
+          sendJson(response, error.status, { error: error.code, message: error.message });
+          return;
+        }
+        this.onLog?.(`HTTP handler failed: ${error instanceof Error ? error.message : String(error)}`);
+        sendJson(response, 500, { error: "internal_error", message: "Internal relay error" });
       });
     });
-    const websocketServer = new WebSocketServer({ noServer: true });
+    this.websocketServer = new WebSocketServer({ noServer: true, maxPayload: 30_000_000 });
     this.server.on("upgrade", (request, socket, head) => {
+      if (!this.consumeRateLimit(request)) {
+        socket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
       const url = new URL(request.url ?? "/", "http://relay.local");
       const match = url.pathname.match(/^\/v1\/gateways\/([0-9a-f-]{36})$/i);
-      if (!match?.[1]) {
+      const grant = match?.[1] ? this.grants.get(match[1]) : undefined;
+      const ownerToken = bearerToken(request);
+      if (!grant || grant.revoked || !ownerToken || !verifySecret(ownerToken, grant.ownerTokenHash)) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
         socket.destroy();
         return;
       }
-      const grant = this.grants.get(match[1]);
-      if (!grant || grant.revoked || url.searchParams.get("ownerToken") !== grant.ownerToken) {
-        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-        socket.destroy();
-        return;
-      }
-      websocketServer.handleUpgrade(request, socket, head, (websocket) => {
+      this.websocketServer!.handleUpgrade(request, socket, head, (websocket) => {
         this.attachGateway(grant.id, websocket);
       });
     });
+    this.heartbeat = setInterval(() => this.heartbeatGateways(), 30_000);
+    this.heartbeat.unref();
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
       this.server!.listen(options.port ?? 0, host, resolve);
     });
     const address = this.server.address();
     if (!address || typeof address === "string") throw new Error("Unable to resolve relay address");
-    this.publicBaseUrl = options.publicBaseUrl ?? `http://${host}:${address.port}`;
+    const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+    this.publicBaseUrl = options.publicBaseUrl ?? `http://${urlHost}:${address.port}`;
     return { origin: this.publicBaseUrl, port: address.port };
   }
 
   async stop(): Promise<void> {
-    for (const gateway of this.gateways.values()) gateway.close();
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
+    for (const gateway of this.gateways.values()) gateway.terminate();
     this.gateways.clear();
+    this.websocketServer?.close();
+    this.websocketServer = undefined;
     if (!this.server) return;
     await new Promise<void>((resolve, reject) => this.server!.close((error) => (error ? reject(error) : resolve())));
     this.server = undefined;
   }
 
+  dropGatewayConnection(grantId: string): boolean {
+    const gateway = this.gateways.get(grantId);
+    if (!gateway) return false;
+    gateway.terminate();
+    return true;
+  }
+
   private async handleHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.consumeRateLimit(request)) {
+      sendJson(response, 429, { error: "rate_limited", message: "Too many requests" });
+      return;
+    }
     const method = request.method ?? "GET";
     const url = new URL(request.url ?? "/", this.publicBaseUrl ?? "http://relay.local");
 
@@ -109,16 +185,34 @@ export class RelayServer {
       return;
     }
 
-    if (method === "GET" && url.pathname.startsWith("/invite/")) {
-      response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      response.end("<!doctype html><meta charset='utf-8'><title>Agent Delegation Link</title><h1>Agent Delegation Link</h1><p>Open this link with the <code>adl invoke</code> command. Keep the URL fragment secret.</p>");
+    if (method === "GET" && /^\/invite\/[0-9a-f-]{36}$/i.test(url.pathname)) {
+      response.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
+        "x-frame-options": "DENY"
+      });
+      response.end("<!doctype html><meta charset='utf-8'><title>Agent Delegation Link</title><style>body{font:16px system-ui;max-width:42rem;margin:4rem auto;padding:0 1rem}code{background:#eee;padding:.15rem .3rem}</style><h1>Agent Delegation Link</h1><p>This URL contains a secret in its fragment. Give the full link only to the intended collaborator.</p><p>Use <code>adl invoke '&lt;full-link&gt;' --goal '...'</code>, or configure the ADL MCP server.</p>");
       return;
     }
 
     if (method === "POST" && url.pathname === "/v1/grants") {
-      const parsed = createGrantRequestSchema.safeParse(await readJson(request));
+      if (this.registrationTokenHash) {
+        const registrationToken = request.headers["x-adl-relay-token"];
+        if (typeof registrationToken !== "string" || !verifySecret(registrationToken, this.registrationTokenHash)) {
+          sendJson(response, 401, { error: "registration_required", message: "A valid relay registration token is required" });
+          return;
+        }
+      }
+      const parsed = createGrantRequestSchema.safeParse(await readJson(request, 64_000));
       if (!parsed.success) {
         sendJson(response, 400, { error: "invalid_grant", message: parsed.error.message });
+        return;
+      }
+      if (Date.parse(parsed.data.policy.expiresAt) <= Date.now()) {
+        sendJson(response, 400, { error: "invalid_grant", message: "Grant expiry must be in the future" });
         return;
       }
       if (this.grants.has(parsed.data.grantId)) {
@@ -128,10 +222,11 @@ export class RelayServer {
       const ownerToken = createSecret();
       this.grants.set(parsed.data.grantId, {
         id: parsed.data.grantId,
-        secretHash: parsed.data.secretHash,
-        ownerToken,
+        relayCredentialHash: parsed.data.relayCredentialHash,
+        ownerTokenHash: hashSecret(ownerToken),
         policy: parsed.data.policy,
         acceptedTasks: 0,
+        clientRequests: new Map(),
         revoked: false
       });
       sendJson(response, 201, { grantId: parsed.data.grantId, ownerToken });
@@ -142,9 +237,24 @@ export class RelayServer {
     if (method === "POST" && grantTasksMatch?.[1]) {
       const grant = this.authorizeGrant(request, grantTasksMatch[1], response);
       if (!grant) return;
-      const parsed = taskRequestSchema.safeParse(await readJson(request));
+      const parsed = taskSubmissionSchema.safeParse(await readJson(request, 300_000));
       if (!parsed.success) {
         sendJson(response, 400, { error: "invalid_task", message: parsed.error.message });
+        return;
+      }
+      const existingTaskId = grant.clientRequests.get(parsed.data.clientRequestId);
+      if (existingTaskId) {
+        const existing = this.tasks.get(existingTaskId)!;
+        if (!samePermissions(existing.requestedPermissions, parsed.data.requestedPermissions)) {
+          sendJson(response, 409, { error: "idempotency_conflict", message: "Request ID was reused with different metadata" });
+          return;
+        }
+        sendJson(response, 200, {
+          taskId: existing.id,
+          status: existing.status,
+          gatewayOnline: this.isGatewayOnline(grant.id),
+          deduplicated: true
+        });
         return;
       }
       const policyError = this.validateTaskPolicy(grant, parsed.data);
@@ -153,19 +263,28 @@ export class RelayServer {
         return;
       }
       const now = new Date().toISOString();
-      const task: StoredTask = {
+      const task: RelayStoredTask = {
         id: randomUUID(),
         grantId: grant.id,
-        request: parsed.data,
+        clientRequestId: parsed.data.clientRequestId,
+        requestedPermissions: parsed.data.requestedPermissions,
+        requestEnvelope: parsed.data.envelope,
         status: "queued",
         createdAt: now,
         updatedAt: now,
-        progress: []
+        gatewayOnlineAtAcceptance: this.isGatewayOnline(grant.id),
+        progressEnvelopes: []
       };
       grant.acceptedTasks += 1;
+      grant.clientRequests.set(task.clientRequestId, task.id);
       this.tasks.set(task.id, task);
       this.offerTask(task);
-      sendJson(response, 202, { taskId: task.id, status: task.status });
+      sendJson(response, 202, {
+        taskId: task.id,
+        status: task.status,
+        gatewayOnline: task.gatewayOnlineAtAcceptance,
+        deduplicated: false
+      });
       return;
     }
 
@@ -185,12 +304,13 @@ export class RelayServer {
     const revokeMatch = url.pathname.match(/^\/v1\/grants\/([0-9a-f-]{36})$/i);
     if (method === "DELETE" && revokeMatch?.[1]) {
       const grant = this.grants.get(revokeMatch[1]);
-      if (!grant || bearerToken(request) !== grant.ownerToken) {
+      const ownerToken = bearerToken(request);
+      if (!grant || !ownerToken || !verifySecret(ownerToken, grant.ownerTokenHash)) {
         sendJson(response, 401, { error: "unauthorized", message: "Invalid owner token" });
         return;
       }
       grant.revoked = true;
-      this.gateways.get(grant.id)?.close();
+      this.gateways.get(grant.id)?.close(1000, "Grant revoked");
       sendJson(response, 200, { revoked: true });
       return;
     }
@@ -198,15 +318,11 @@ export class RelayServer {
     sendJson(response, 404, { error: "not_found", message: "Route not found" });
   }
 
-  private authorizeGrant(
-    request: IncomingMessage,
-    grantId: string,
-    response: ServerResponse
-  ): GrantRecord | undefined {
+  private authorizeGrant(request: IncomingMessage, grantId: string, response: ServerResponse): GrantRecord | undefined {
     const grant = this.grants.get(grantId);
-    const secret = bearerToken(request);
-    if (!grant || !secret || !verifySecret(secret, grant.secretHash)) {
-      sendJson(response, 401, { error: "unauthorized", message: "Invalid delegation secret" });
+    const credential = bearerToken(request);
+    if (!grant || !credential || !verifySecret(credential, grant.relayCredentialHash)) {
+      sendJson(response, 401, { error: "unauthorized", message: "Invalid delegation credential" });
       return undefined;
     }
     if (grant.revoked) {
@@ -216,22 +332,23 @@ export class RelayServer {
     return grant;
   }
 
-  private validateTaskPolicy(grant: GrantRecord, task: TaskRequest): string | undefined {
+  private validateTaskPolicy(grant: GrantRecord, task: TaskSubmission): string | undefined {
     if (Date.parse(grant.policy.expiresAt) <= Date.now()) return "Delegation link has expired";
     if (grant.acceptedTasks >= grant.policy.maxTasks) return "Delegation task limit has been reached";
     const allowed = new Set(grant.policy.permissions);
     const denied = task.requestedPermissions.find((permission) => !allowed.has(permission));
     if (denied) return `Permission '${denied}' is outside the delegation scope`;
-    if (grant.policy.approval === "ask_every_time") return "Interactive owner approval is not implemented in v0.1";
     return undefined;
   }
 
-  private attachGateway(grantId: string, websocket: WebSocket): void {
-    this.gateways.get(grantId)?.close();
+  private attachGateway(grantId: string, websocket: LiveWebSocket): void {
+    this.gateways.get(grantId)?.close(1000, "Replaced by a new gateway connection");
+    websocket.isAlive = true;
     this.gateways.set(grantId, websocket);
+    websocket.on("pong", () => { websocket.isAlive = true; });
     websocket.send(JSON.stringify({ type: "gateway.ready" }));
     for (const task of this.tasks.values()) {
-      if (task.grantId === grantId && task.status === "queued") this.offerTask(task);
+      if (task.grantId === grantId && (task.status === "queued" || task.status === "running")) this.offerTask(task);
     }
     websocket.on("message", (data) => this.handleGatewayMessage(grantId, data.toString()));
     websocket.on("close", () => {
@@ -239,7 +356,7 @@ export class RelayServer {
     });
   }
 
-  private offerTask(task: StoredTask): void {
+  private offerTask(task: RelayStoredTask): void {
     const gateway = this.gateways.get(task.grantId);
     if (gateway?.readyState === WebSocket.OPEN) {
       gateway.send(JSON.stringify({ type: "task.offered", task }));
@@ -247,33 +364,66 @@ export class RelayServer {
   }
 
   private handleGatewayMessage(grantId: string, raw: string): void {
-    let event: GatewayOutboundEvent;
+    let decoded: unknown;
     try {
-      event = JSON.parse(raw) as GatewayOutboundEvent;
+      decoded = JSON.parse(raw) as unknown;
     } catch {
       return;
     }
-    if (!event || typeof event !== "object" || !("taskId" in event)) return;
+    const parsed = gatewayOutboundEventSchema.safeParse(decoded);
+    if (!parsed.success) return;
+    const event = parsed.data;
+    if (event.type === "task.progress" && event.envelope.ciphertext.length > 4_000) return;
+    if (event.type === "task.failed" && event.envelope.ciphertext.length > 20_000) return;
     const task = this.tasks.get(event.taskId);
     if (!task || task.grantId !== grantId || task.status === "completed" || task.status === "failed") return;
     task.updatedAt = new Date().toISOString();
     if (event.type === "task.started") {
       task.status = "running";
     } else if (event.type === "task.progress") {
-      task.progress.push(event.message.slice(0, 2_000));
-      if (task.progress.length > 100) task.progress.shift();
+      task.progressEnvelopes.push(event.envelope);
+      if (task.progressEnvelopes.length > 100) task.progressEnvelopes.shift();
     } else if (event.type === "task.completed") {
-      const result = taskResultSchema.safeParse(event.result);
-      if (!result.success) {
-        task.status = "failed";
-        task.error = "Gateway returned an invalid result";
-      } else {
-        task.status = "completed";
-        task.result = result.data;
-      }
-    } else if (event.type === "task.failed") {
+      task.status = "completed";
+      task.resultEnvelope = event.envelope;
+    } else {
       task.status = "failed";
-      task.error = event.error.slice(0, 10_000);
+      task.errorEnvelope = event.envelope;
     }
+  }
+
+  private heartbeatGateways(): void {
+    for (const [grantId, websocket] of this.gateways) {
+      if (websocket.isAlive === false) {
+        websocket.terminate();
+        this.gateways.delete(grantId);
+        continue;
+      }
+      websocket.isAlive = false;
+      websocket.ping();
+    }
+    const expiry = Date.now() - 2 * 60_000;
+    for (const [key, bucket] of this.rateBuckets) {
+      if (bucket.startedAt < expiry) this.rateBuckets.delete(key);
+    }
+  }
+
+  private isGatewayOnline(grantId: string): boolean {
+    return this.gateways.get(grantId)?.readyState === WebSocket.OPEN;
+  }
+
+  private consumeRateLimit(request: IncomingMessage): boolean {
+    const forwarded = this.trustProxy ? request.headers["x-forwarded-for"] : undefined;
+    const key = (Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0]?.trim())
+      ?? request.socket.remoteAddress
+      ?? "unknown";
+    const now = Date.now();
+    const existing = this.rateBuckets.get(key);
+    if (!existing || now - existing.startedAt >= 60_000) {
+      this.rateBuckets.set(key, { startedAt: now, count: 1 });
+      return true;
+    }
+    existing.count += 1;
+    return existing.count <= this.maxRequestsPerMinute;
   }
 }

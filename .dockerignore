@@ -1,0 +1,7 @@
+node_modules
+dist
+.git
+.adl
+coverage
+*.log
+*.tgz

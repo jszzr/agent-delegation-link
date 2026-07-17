@@ -8,6 +8,7 @@ export interface AgentExecutionContext {
   cwd: string;
   permissions: Permission[];
   onProgress: (message: string) => void;
+  timeoutMs: number;
 }
 
 export interface AgentExecutionResult {
@@ -63,13 +64,19 @@ export class CodexCliAdapter implements AgentAdapter {
     let buffered = "";
     const result = await runProcess(
       "codex",
-      ["exec", "--json", "--ephemeral", "--ignore-user-config", "--sandbox", sandbox, "--cd", context.cwd, "-"],
+      [
+        "--ask-for-approval", "never",
+        "--sandbox", sandbox,
+        "--cd", context.cwd,
+        "exec", "--json", "--ephemeral", "--ignore-user-config", "-"
+      ],
       {
         cwd: context.cwd,
         input: prompt,
         env: safeAgentEnvironment(),
         onStdout: (chunk) => {
           buffered += chunk;
+          if (buffered.length > 100_000) buffered = buffered.slice(-100_000);
           const lines = buffered.split("\n");
           buffered = lines.pop() ?? "";
           for (const line of lines) {
@@ -80,9 +87,12 @@ export class CodexCliAdapter implements AgentAdapter {
               // Codex JSONL may evolve; raw output remains available in the final result.
             }
           }
-        }
+        },
+        timeoutMs: context.timeoutMs,
+        maxOutputBytes: 2_000_000
       }
     );
+    if (result.timedOut) throw new Error(`Codex exceeded the ${Math.ceil(context.timeoutMs / 1_000)} second task limit`);
     if (result.exitCode !== 0) throw new Error(`Codex exited with ${result.exitCode}: ${result.stderr.slice(-4_000)}`);
     return {
       summary: extractCodexSummary(result.stdout) ?? "Codex completed the delegated task",
@@ -97,7 +107,7 @@ export class ClaudeCliAdapter implements AgentAdapter {
   async execute(context: AgentExecutionContext): Promise<AgentExecutionResult> {
     const canEdit = context.permissions.includes("edit");
     const tools = canEdit ? "Read,Glob,Grep,Edit,Write" : "Read,Glob,Grep";
-    const permissionMode = canEdit ? "acceptEdits" : "plan";
+    const permissionMode = canEdit ? "dontAsk" : "plan";
     const prompt = buildPrompt(context.task, context.permissions);
     let buffered = "";
     const result = await runProcess(
@@ -120,6 +130,7 @@ export class ClaudeCliAdapter implements AgentAdapter {
         env: safeAgentEnvironment(),
         onStdout: (chunk) => {
           buffered += chunk;
+          if (buffered.length > 100_000) buffered = buffered.slice(-100_000);
           const lines = buffered.split("\n");
           buffered = lines.pop() ?? "";
           for (const line of lines) {
@@ -130,9 +141,12 @@ export class ClaudeCliAdapter implements AgentAdapter {
               // Preserve compatibility with future stream event variants.
             }
           }
-        }
+        },
+        timeoutMs: context.timeoutMs,
+        maxOutputBytes: 2_000_000
       }
     );
+    if (result.timedOut) throw new Error(`Claude exceeded the ${Math.ceil(context.timeoutMs / 1_000)} second task limit`);
     if (result.exitCode !== 0) throw new Error(`Claude exited with ${result.exitCode}: ${result.stderr.slice(-4_000)}`);
     return {
       summary: extractClaudeSummary(result.stdout) ?? "Claude completed the delegated task",
