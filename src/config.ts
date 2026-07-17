@@ -7,6 +7,7 @@ export const DEFAULT_RELAY_ORIGIN = "https://47.94.129.192";
 
 export interface AdlConfig {
   relayOrigin: string;
+  relayApiKey?: string;
   relayRegistrationToken?: string;
 }
 
@@ -49,8 +50,13 @@ export async function loadConfig(configPath = getConfigPath()): Promise<AdlConfi
       && (typeof record.relayRegistrationToken !== "string" || record.relayRegistrationToken.trim() === "")) {
     throw new Error(`ADL config contains an invalid relayRegistrationToken: ${configPath}`);
   }
+  if (record.relayApiKey !== undefined
+      && (typeof record.relayApiKey !== "string" || !/^adl_usr_[A-Za-z0-9_-]{43}$/.test(record.relayApiKey))) {
+    throw new Error(`ADL config contains an invalid relayApiKey: ${configPath}`);
+  }
   return {
     relayOrigin: record.relayOrigin,
+    ...(typeof record.relayApiKey === "string" ? { relayApiKey: record.relayApiKey } : {}),
     ...(typeof record.relayRegistrationToken === "string"
       ? { relayRegistrationToken: record.relayRegistrationToken }
       : {})
@@ -78,6 +84,7 @@ export async function saveConfig(config: AdlConfig, configPath = getConfigPath()
 
 export async function resolveRelaySettings(options: {
   relayOrigin?: string;
+  relayApiKeyEnvironment?: string;
   relayTokenEnvironment?: string;
   environment?: NodeJS.ProcessEnv;
   configPath?: string;
@@ -88,14 +95,18 @@ export async function resolveRelaySettings(options: {
     ?? environment.ADL_RELAY_URL
     ?? config?.relayOrigin
     ?? DEFAULT_RELAY_ORIGIN;
-  const savedTokenMatchesRelay = config?.relayRegistrationToken !== undefined
-    && sameOrigin(relayOrigin, config.relayOrigin);
+  const savedCredentialMatchesRelay = config !== undefined && sameOrigin(relayOrigin, config.relayOrigin);
+  const relayApiKey = options.relayApiKeyEnvironment === undefined
+    ? environment.ADL_RELAY_API_KEY
+      ?? (savedCredentialMatchesRelay ? config?.relayApiKey : undefined)
+    : requireEnvironment(options.relayApiKeyEnvironment, environment);
   const relayRegistrationToken = options.relayTokenEnvironment === undefined
     ? environment.ADL_RELAY_REGISTRATION_TOKEN
-      ?? (savedTokenMatchesRelay ? config.relayRegistrationToken : undefined)
+      ?? (savedCredentialMatchesRelay ? config?.relayRegistrationToken : undefined)
     : requireEnvironment(options.relayTokenEnvironment, environment);
   return {
     relayOrigin,
+    ...(relayApiKey === undefined ? {} : { relayApiKey }),
     ...(relayRegistrationToken === undefined ? {} : { relayRegistrationToken })
   };
 }

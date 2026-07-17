@@ -20,18 +20,16 @@ Install the Codex Skill by asking Codex:
 Use $skill-installer to install delegate-to-agent from https://github.com/jszzr/agent-delegation-link/tree/main/.agents/skills/delegate-to-agent
 ```
 
-## Owner: one-time setup
+## Link owner: register once
 
-The public default Relay is `https://47.94.129.192`. Its registration token is deliberately not stored in this public repository. The Relay operator gives it only to people allowed to create links.
+The default Relay is `https://47.94.129.192`. Ask its operator for a one-use invitation code, then register the machine that will create links:
 
 ```bash
-read -s ADL_RELAY_TOKEN
-export ADL_RELAY_TOKEN
-adl setup --token-env ADL_RELAY_TOKEN
-unset ADL_RELAY_TOKEN
+ADL_INVITE_CODE='adl_inv_...' adl register --name 'Alice laptop'
+unset ADL_INVITE_CODE
 ```
 
-The token is saved locally with owner-only permissions. A task sender does not need this token.
+ADL exchanges the code for an individual API key and saves it locally with owner-only permissions. The code works once; the Relay stores only credential hashes. A collaborator who only sends a task through your link does not register.
 
 ## Create a link
 
@@ -77,6 +75,16 @@ claude mcp add --scope user adl -- adl mcp
 - stopping the owner gateway revokes the link.
 
 More: [test runbook](docs/ALPHA_TEST.md), [security model](SECURITY.md), [architecture](docs/ARCHITECTURE.md).
+
+## Relay operator
+
+The admin token stays only with the Relay operator and cannot create delegation links. Generate a user invitation with:
+
+```bash
+ADL_RELAY_ADMIN_TOKEN='...' adl access invite --label 'Alice laptop'
+```
+
+Use `adl access users`, `adl access revoke <user-id>`, and the per-invitation quota flags to manage a small invited test group. The supplied Docker Compose deployment persists hashed users/invitations and its hash-chained access audit under `/data`.
 
 Development: `npm ci && npm run check && npm test && npm run build`
 

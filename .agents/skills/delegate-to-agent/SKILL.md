@@ -11,7 +11,7 @@ Use `adl` to map a natural-language request to one of two roles. Treat every com
 
 1. Run `adl --version` without exposing environment values.
 2. If `adl` is missing, verify Node.js 22 or newer, run `npm install -g https://github.com/jszzr/agent-delegation-link.git`, and verify the command again.
-3. Do not ask the user to paste a Relay registration token into chat. If owner setup is missing, instruct them to load the token into a temporary environment variable and run `adl setup --token-env <NAME>`. The command stores it in an owner-only local config file.
+3. Before creating a link, run `adl access whoami`. If the device is not registered, ask the Relay operator for a one-use invitation code—never for the administrator token. Load the code into `ADL_INVITE_CODE`, run `adl register --name <device-label>`, then unset it. ADL saves the resulting per-user API key in an owner-only local config and never prints it.
 
 ## Create A Link For The Owner
 

@@ -11,7 +11,7 @@ npm install -g https://github.com/jszzr/agent-delegation-link.git
 adl --version
 ```
 
-Expected version: `0.3.0-alpha.1`.
+Expected version: `0.4.0-alpha.1`.
 
 Install the `delegate-to-agent` Skill from `.agents/skills/delegate-to-agent` with Codex's `$skill-installer`. Optionally register the sender MCP tool:
 
@@ -21,18 +21,17 @@ codex mcp add adl -- adl mcp
 
 The owner machine must also have an authenticated Codex or Claude Code CLI. Linux Codex owners must verify its Bubblewrap/AppArmor sandbox with `codex doctor`; do not bypass sandbox failures with `danger-full-access`.
 
-## 2. Configure the owner once
+## 2. Register the link owner once
 
-The Relay operator privately gives the owner the registration token. A sender does not need it.
+The Relay operator privately gives the owner a one-use invitation code. A collaborator who only sends a task does not need one.
 
 ```bash
-read -s ADL_RELAY_TOKEN
-export ADL_RELAY_TOKEN
-adl setup --token-env ADL_RELAY_TOKEN
-unset ADL_RELAY_TOKEN
+ADL_INVITE_CODE='adl_inv_...' adl register --name 'Alice test laptop'
+unset ADL_INVITE_CODE
+adl access whoami
 ```
 
-Verify that ADL reports the expected Relay and an owner-only config path without printing the token.
+Verify that ADL reports the expected Relay, an owner-only config path, and the assigned quotas without printing the API key. Confirm that reusing the invitation fails.
 
 ## 3. Owner creates a link
 
@@ -86,6 +85,7 @@ Create a fresh one-task link for each check:
 - deny owner approval and verify the agent does not start;
 - request a permission not present in the grant and verify rejection;
 - stop the owner gateway and verify the link is revoked;
-- reuse a consumed link and verify the one-task limit.
+- reuse a consumed link and verify the one-task limit;
+- ask the Relay operator to revoke the test user, then verify its current link closes and it cannot create another link.
 
-Record only task IDs, timestamps, agent pairing, result, and sanitized errors. Never copy invitation URLs, registration tokens, private task text, or patches into a public issue.
+Record only task IDs, timestamps, agent pairing, result, and sanitized errors. Never copy delegation links, invitation codes, API/admin tokens, private task text, or patches into a public issue.

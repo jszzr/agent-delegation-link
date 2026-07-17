@@ -11,6 +11,16 @@ afterEach(async () => {
 });
 
 describe("local Relay configuration", () => {
+  it("stores a per-user API key in an owner-only file", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "adl-config-user-"));
+    cleanup.push(directory);
+    const file = path.join(directory, "config.json");
+    const apiKey = `adl_usr_${"a".repeat(43)}`;
+    await saveConfig({ relayOrigin: DEFAULT_RELAY_ORIGIN, relayApiKey: apiKey }, file);
+    expect(await loadConfig(file)).toEqual({ relayOrigin: DEFAULT_RELAY_ORIGIN, relayApiKey: apiKey });
+    if (process.platform !== "win32") expect((await stat(file)).mode & 0o777).toBe(0o600);
+  });
+
   it("stores the registration token in an owner-only file", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "adl-config-"));
     cleanup.push(directory);
@@ -53,7 +63,11 @@ describe("local Relay configuration", () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "adl-config-origin-"));
     cleanup.push(directory);
     const file = path.join(directory, "config.json");
-    await saveConfig({ relayOrigin: "https://saved.example", relayRegistrationToken: "saved-token" }, file);
+    await saveConfig({
+      relayOrigin: "https://saved.example",
+      relayApiKey: `adl_usr_${"b".repeat(43)}`,
+      relayRegistrationToken: "saved-token"
+    }, file);
     await expect(resolveRelaySettings({
       configPath: file,
       relayOrigin: "https://other.example",

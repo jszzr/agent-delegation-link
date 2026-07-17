@@ -5,13 +5,17 @@ services:
     environment:
       ADL_PUBLIC_BASE_URL: https://${ADL_DOMAIN:?Set ADL_DOMAIN}
       ADL_RATE_LIMIT: ${ADL_RATE_LIMIT:-120}
-      ADL_RELAY_REGISTRATION_TOKEN: ${ADL_RELAY_REGISTRATION_TOKEN:?Set a strong registration token}
+      ADL_RELAY_ADMIN_TOKEN: ${ADL_RELAY_ADMIN_TOKEN:?Set a strong admin token}
+      ADL_ACCESS_FILE: /data/access.json
+      ADL_ACCESS_AUDIT_FILE: /data/access-audit.jsonl
     expose:
       - "8787"
     restart: unless-stopped
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
+    volumes:
+      - relay_data:/data
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -35,5 +39,6 @@ services:
       - no-new-privileges:true
 
 volumes:
+  relay_data:
   caddy_data:
   caddy_config:

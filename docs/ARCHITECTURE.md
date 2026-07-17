@@ -23,7 +23,16 @@ The first alpha targets trusted invited collaborators. It does not claim that a 
 3. The gateway sends the relay only the digest of the relay credential and public policy.
 4. The original secret is placed after `#secret=` in the invitation URL.
 5. The relay returns a separate random owner token. Its digest is kept in memory, and the raw token is sent only in the gateway WebSocket authorization header.
-6. An optional operator registration token restricts who may create grants on a hosted relay.
+6. On an access-controlled Relay, the gateway authenticates with its user's API key. The administrator token cannot create grants.
+
+## Relay access lifecycle
+
+1. The Relay operator creates a random, expiring, one-use invitation with per-user grant quotas.
+2. A user exchanges it for a random device API key. Only invitation and API-key SHA-256 hashes are persisted by the Relay.
+3. The device saves the API key in its owner-only local config and sends it only in HTTPS authorization headers when creating grants.
+4. The operator can list or revoke users. Revocation invalidates the API key and closes every active grant created by that user.
+
+User/invitation state, hourly quota timestamps, and a hash-chained access audit are file-backed. Grants and tasks remain in memory, so a Relay restart clears both them and their corresponding active-grant counts.
 
 ## Encrypted task lifecycle
 

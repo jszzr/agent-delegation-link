@@ -28,6 +28,7 @@ export interface GatewayOptions {
   validationCommands?: string[];
   auditFile?: string;
   relayRegistrationToken?: string;
+  relayApiKey?: string;
   executionMode?: ExecutionMode;
   approveTask?: (task: TaskRequest, context: { taskId: string; policy: GrantPolicy }) => boolean | Promise<boolean>;
   onLog?: (message: string) => void;
@@ -74,6 +75,9 @@ export class DelegationGateway {
       method: "POST",
       headers: {
         "content-type": "application/json",
+        ...(this.options.relayApiKey === undefined
+          ? {}
+          : { authorization: `Bearer ${this.options.relayApiKey}` }),
         ...(this.options.relayRegistrationToken === undefined
           ? {}
           : { "x-adl-relay-token": this.options.relayRegistrationToken })
@@ -91,6 +95,10 @@ export class DelegationGateway {
       await this.openWebSocket();
     } catch (error) {
       this.stopped = true;
+      await fetchWithTimeout(new URL(`/v1/grants/${grantId}`, this.options.relayOrigin), {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${body.ownerToken}` }
+      }, 10_000).catch(() => undefined);
       throw error;
     }
     if (!await this.recordAudit("grant.created", {
