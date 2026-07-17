@@ -68,7 +68,7 @@ export class CodexCliAdapter implements AgentAdapter {
         "--ask-for-approval", "never",
         "--sandbox", sandbox,
         "--cd", context.cwd,
-        "exec", "--json", "--ephemeral", "--ignore-user-config", "-"
+        "exec", "--json", "--ephemeral", "--ignore-user-config", "--skip-git-repo-check", "-"
       ],
       {
         cwd: context.cwd,

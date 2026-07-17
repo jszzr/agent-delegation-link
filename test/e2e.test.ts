@@ -68,6 +68,7 @@ describe("local end-to-end delegation", () => {
     });
     const task = await waitForTask(invitationUrl, taskId, { timeoutMs: 10_000, pollMs: 25 });
     expect(task.status).toBe("completed");
+    expect(task.result?.executionMode).toBe("worktree");
     expect(task.result?.changedFiles).toContain("delegated-result.txt");
     expect(task.result?.patch).toContain("prove delegation");
     expect(task.result?.validations[0]?.exitCode).toBe(0);

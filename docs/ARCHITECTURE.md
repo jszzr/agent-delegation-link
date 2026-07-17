@@ -40,7 +40,9 @@ Tasks can remain encrypted in the relay while the owner is offline. The gateway 
 
 ## Execution boundary
 
-The gateway serializes tasks. After approval it:
+The gateway serializes tasks. After approval it selects one owner-controlled execution mode.
+
+In `worktree` mode it:
 
 1. creates a detached temporary worktree at repository `HEAD`;
 2. launches the selected agent with bounded time/output and a reduced environment;
@@ -50,6 +52,16 @@ The gateway serializes tasks. After approval it:
 6. destroys the worktree.
 
 The returned patch is never applied automatically by ADL. The sender or sender agent must review it and choose whether to run `git apply`.
+
+In `direct` mode it:
+
+1. resolves the selected directory without requiring Git or `HEAD`;
+2. records a bounded content-hash snapshot, excluding `.git`, `.adl`, and `node_modules`;
+3. launches the selected agent in that directory;
+4. runs owner-configured validators when requested;
+5. compares the before/after snapshots and returns changed paths with an empty patch.
+
+Direct mode is deliberately restricted to `ask_every_time` approval. It writes before validation and does not roll back failed tasks, so it is the convenient trusted-collaborator path rather than the isolated review path.
 
 ## Adapter boundary
 

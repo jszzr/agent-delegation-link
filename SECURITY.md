@@ -1,6 +1,6 @@
 # Security model
 
-Version `0.2.0-alpha.2` is intended for controlled tests between trusted collaborators on non-sensitive repositories. Do not give links to anonymous users, execute tasks from people you do not trust, or treat this as a hardened sandbox for hostile code.
+Version `0.3.0-alpha.1` is intended for controlled tests between trusted collaborators on non-sensitive directories. Do not give links to anonymous users, execute tasks from people you do not trust, or treat this as a hardened sandbox for hostile code.
 
 ## What the alpha protects
 
@@ -21,7 +21,7 @@ The relay still sees routing metadata: grant policy, requested permission names,
 - replayed submissions use a UUID idempotency key and do not consume another task slot;
 - the relay and gateway independently check requested permissions;
 - public deployment can require an operator registration token before a user creates grants;
-- request bodies, WebSocket messages, progress history, process output, patch size, and execution duration are bounded;
+- request bodies, WebSocket messages, progress history, process output, patch size, direct-workspace inspection, and execution duration are bounded;
 - the relay applies per-source-IP rate limits and heartbeat-based dead-connection cleanup.
 
 The relay is currently in-memory. Its rate limiter and replay state do not survive restart and do not stop a distributed denial-of-service attack.
@@ -29,16 +29,18 @@ The relay is currently in-memory. Its rate limiter and replay state do not survi
 ### Local execution boundary
 
 - owner confirmation is required for every task by default; non-interactive approval fails closed;
-- each task uses a detached temporary Git worktree at committed `HEAD`;
-- uncommitted owner changes are excluded and the original checkout is not modified;
+- worktree mode uses a detached temporary Git worktree at committed `HEAD`; uncommitted owner changes are excluded and the original checkout is not modified;
+- direct mode does not require Git or `HEAD` and edits the selected owner directory in place, so it is restricted to per-task interactive approval;
 - validation commands are chosen by the owner when sharing, never by the remote sender;
-- edit requests that produce no patch and owner validations that exit nonzero fail closed;
+- worktree edit requests that produce no patch, direct edit requests with no detected changed path, and owner validations that exit nonzero fail closed;
 - child processes inherit an environment allowlist rather than the complete environment;
 - Codex runs ephemerally, ignores user config, uses `read-only` or `workspace-write` sandboxing, disables interactive escalation, and does not enable web search;
 - Linux owners must provide a working Bubblewrap/AppArmor user-namespace profile; do not bypass a sandbox initialization failure with `danger-full-access`;
 - Claude runs in safe mode without session persistence and receives only explicit file tools; Bash and web tools are not granted.
 
-The worktree is edit isolation, not a complete OS security boundary. The CLIs still need local authentication, and Claude's file-tool restrictions are not equivalent to a container or VM. A compromised agent runtime or undiscovered CLI escape may access more of the host than intended. Use a disposable OS account or VM for higher-risk testing.
+The worktree is edit isolation, not a complete OS security boundary. Direct mode provides even less isolation: changes happen before validation, failed tasks are not rolled back, and its changed-path snapshot intentionally excludes `.git`, `.adl`, and `node_modules`. The CLIs still need local authentication, and Claude's file-tool restrictions are not equivalent to a container or VM. A compromised agent runtime or undiscovered CLI escape may access more of the host than intended. Use a disposable OS account or VM for higher-risk testing.
+
+`adl setup` stores the Relay registration token as plaintext in the local ADL config because the owner gateway must send it when creating a grant. On POSIX systems ADL creates and requires mode `0600`; never commit, share, or copy this config into a synchronized public folder.
 
 ### Audit
 
@@ -69,4 +71,4 @@ The `sender` field is self-asserted and not cryptographically authenticated. End
 
 ## Reporting
 
-For this private alpha, report a vulnerability privately to the repository owner. Do not include active invitation URLs, credentials, private task text, or sensitive patches in an issue.
+Report a vulnerability privately to the repository owner. Do not include active invitation URLs, credentials, private task text, or sensitive patches in an issue.

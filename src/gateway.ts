@@ -18,7 +18,7 @@ import {
   type TaskRequest,
   type TaskResult
 } from "./protocol.js";
-import { TemporaryWorktree } from "./worktree.js";
+import { DirectWorkspace, TemporaryWorktree, type ExecutionMode, type ExecutionWorkspace } from "./worktree.js";
 
 export interface GatewayOptions {
   relayOrigin: string;
@@ -28,6 +28,7 @@ export interface GatewayOptions {
   validationCommands?: string[];
   auditFile?: string;
   relayRegistrationToken?: string;
+  executionMode?: ExecutionMode;
   approveTask?: (task: TaskRequest, context: { taskId: string; policy: GrantPolicy }) => boolean | Promise<boolean>;
   onLog?: (message: string) => void;
 }
@@ -48,9 +49,14 @@ export class DelegationGateway {
   private readonly seenClientRequestIds = new Set<string>();
   private readonly policy: GrantPolicy;
   private readonly audit: AuditLog;
+  private readonly executionMode: ExecutionMode;
 
   constructor(private readonly options: GatewayOptions) {
     this.policy = grantPolicySchema.parse(options.policy);
+    this.executionMode = options.executionMode ?? "worktree";
+    if (this.executionMode === "direct" && this.policy.approval !== "ask_every_time") {
+      throw new Error("Direct execution requires --approval ask_every_time");
+    }
     if ((options.validationCommands?.length ?? 0) > 20) throw new Error("At most 20 owner validation commands are allowed");
     if (options.validationCommands?.some((command) => command.length > 2_000)) {
       throw new Error("Owner validation commands must be at most 2000 characters each");
@@ -94,7 +100,8 @@ export class DelegationGateway {
       permissions: this.policy.permissions,
       expiresAt: this.policy.expiresAt,
       maxTasks: this.policy.maxTasks,
-      approval: this.policy.approval
+      approval: this.policy.approval,
+      executionMode: this.executionMode
     })) {
       await this.stop();
       throw new Error("Unable to initialize the local security audit log");
@@ -246,29 +253,37 @@ export class DelegationGateway {
     this.send({ type: "task.started", taskId: task.id });
     this.options.onLog?.(`Executing delegated task ${task.id}`);
     const deadline = Date.now() + this.policy.maxTaskDurationSeconds * 1_000;
-    let worktree: TemporaryWorktree | undefined;
+    let workspace: ExecutionWorkspace | undefined;
+    let adapterStarted = false;
     try {
-      worktree = await TemporaryWorktree.create(this.options.repoPath);
+      workspace = this.executionMode === "direct"
+        ? await DirectWorkspace.create(this.options.repoPath, deadline)
+        : await TemporaryWorktree.create(this.options.repoPath);
+      adapterStarted = true;
       const execution = await this.options.adapter.execute({
         task: request,
-        cwd: worktree.directory,
+        cwd: workspace.directory,
         permissions: request.requestedPermissions,
         timeoutMs: Math.max(1, deadline - Date.now()),
         onProgress: (message) => this.sendProgress(task.id, message)
       });
       if (Date.now() >= deadline) throw new Error("Task exceeded its execution time limit");
-      const collected = await worktree.collect(
+      const collected = await workspace.collect(
         request.requestedPermissions.includes("test") ? this.options.validationCommands ?? [] : [],
         { maxArtifactBytes: this.policy.maxArtifactBytes, deadline }
       );
       if (request.requestedPermissions.includes("edit") && collected.changedFiles.length === 0) {
         throw new Error("Agent produced no changes for a task that requested edit capability");
       }
+      if (!request.requestedPermissions.includes("edit") && collected.changedFiles.length > 0) {
+        throw new Error("Agent modified files without edit capability");
+      }
       const result: TaskResult = {
         summary: execution.summary.slice(0, 100_000),
         patch: collected.patch,
         changedFiles: collected.changedFiles,
         validations: collected.validations,
+        executionMode: this.executionMode,
         artifactTruncated: false,
         ...(execution.rawOutput === undefined ? {} : { rawOutput: execution.rawOutput.slice(-100_000) })
       };
@@ -282,13 +297,18 @@ export class DelegationGateway {
       await this.recordAudit("task.completed", {
         changedFiles: result.changedFiles,
         patchHash: digestAuditValue(result.patch),
-        patchBytes: Buffer.byteLength(result.patch)
+        patchBytes: Buffer.byteLength(result.patch),
+        executionMode: this.executionMode
       }, task.id);
       this.options.onLog?.(`Completed delegated task ${task.id}`);
     } catch (error) {
-      await this.failTask(task.id, error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      const directWarning = this.executionMode === "direct" && adapterStarted
+        ? " Direct mode may already have changed the owner's selected directory; the owner must review it locally."
+        : "";
+      await this.failTask(task.id, `${message}${directWarning}`);
     } finally {
-      await worktree?.dispose().catch(() => undefined);
+      await workspace?.dispose().catch(() => undefined);
     }
   }
 

@@ -47,6 +47,7 @@ describe("coding-agent CLI adapters", () => {
     expect(args).toContain("--sandbox\nread-only");
     expect(args).toContain("--ephemeral");
     expect(args).toContain("--ignore-user-config");
+    expect(args).toContain("--skip-git-repo-check");
   });
 
   it("parses a Claude stream result without calling a real model", async () => {

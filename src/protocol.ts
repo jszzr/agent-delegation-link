@@ -54,6 +54,7 @@ export const taskResultSchema = z.object({
   patch: z.string(),
   changedFiles: z.array(z.string()).max(10_000),
   validations: z.array(validationResultSchema).max(100),
+  executionMode: z.enum(["worktree", "direct"]).optional(),
   rawOutput: z.string().max(100_000).optional(),
   artifactTruncated: z.boolean().default(false)
 });

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegate to Agent"
+  short_description: "Create links and delegate tasks between coding agents"
+  default_prompt: "Use $delegate-to-agent to share this folder or send a task through an ADL invitation link."
