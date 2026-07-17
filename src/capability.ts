@@ -28,12 +28,22 @@ export interface ParsedInvitation {
 
 export function parseInvitationUrl(value: string): ParsedInvitation {
   const url = new URL(value);
+  assertSecureRelayOrigin(value);
   const match = url.pathname.match(/^\/invite\/([0-9a-f-]{36})$/i);
   const secret = new URLSearchParams(url.hash.slice(1)).get("secret");
   if (!match?.[1] || !secret) {
     throw new Error("Invalid delegation link: expected /invite/<grant-id>#secret=<secret>");
   }
   return { relayOrigin: url.origin, grantId: match[1], secret };
+}
+
+export function assertSecureRelayOrigin(value: string): void {
+  const url = new URL(value);
+  if (url.username || url.password) throw new Error("Relay URLs must not contain embedded credentials");
+  const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new Error("Public relay URLs must use HTTPS; plain HTTP is allowed only on loopback");
+  }
 }
 
 export function parseDuration(value: string): number {

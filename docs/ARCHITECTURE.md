@@ -2,61 +2,69 @@
 
 ## Core abstraction
 
-An invitation URL is a task-scoped capability to invoke one local coding agent. It is not a room membership token.
+An invitation URL is a task-scoped capability to one local coding agent, not membership in a shared workspace.
 
 ```text
-Sender Agent -> invoke CLI -> Relay <- WebSocket <- Owner Gateway -> Policy -> Codex/Claude
+Sender agent -> CLI/MCP -> HTTPS relay <- WSS gateway -> policy/approval -> local agent
 ```
 
-Both users make outbound connections, so the design works across NAT and different networks without inbound ports. In v0.1 the relay is run locally; a hosted or self-hosted relay can use the same protocol later.
+Both user-side components create outbound connections. Only the relay needs a public address, which allows users on unrelated networks and behind NAT to collaborate without opening local ports.
 
-## Grant lifecycle
+## Trust boundaries
 
-1. The owner gateway generates a random grant ID and 256-bit secret.
-2. It sends the secret digest and public policy to the relay.
-3. The secret is placed in the invitation URL fragment, which browsers do not send in HTTP requests.
-4. The gateway authenticates its WebSocket with a distinct owner token.
-5. An invoker submits a structured task using the invitation secret.
-6. The relay and gateway independently enforce the capability policy.
-7. Stopping the gateway revokes the grant.
+The sender and owner share the invitation secret. The relay is trusted for availability and policy metadata enforcement, but not for task confidentiality. The local gateway is the final policy authority. The coding agent receives untrusted task text only after decryption and optional owner approval.
 
-## Task lifecycle
+The first alpha targets trusted invited collaborators. It does not claim that a Git worktree alone contains a malicious model, CLI runtime, repository, or validator.
+
+## Grant creation
+
+1. The gateway creates a random grant ID and 256-bit secret.
+2. HKDF-SHA-256 derives separate content-encryption and relay-authentication keys, salted by the grant ID and protocol version.
+3. The gateway sends the relay only the digest of the relay credential and public policy.
+4. The original secret is placed after `#secret=` in the invitation URL.
+5. The relay returns a separate random owner token. Its digest is kept in memory, and the raw token is sent only in the gateway WebSocket authorization header.
+6. An optional operator registration token restricts who may create grants on a hosted relay.
+
+## Encrypted task lifecycle
 
 ```text
 queued -> running -> completed
                   -> failed
 ```
 
-The relay queues accepted tasks until the gateway is online. A gateway processes one task at a time and streams bounded progress messages.
+The sender validates the structured request locally, creates a UUID idempotency key, encrypts the request with AES-256-GCM, and submits only requested permission names plus the envelope. The relay can reject obviously out-of-scope permissions without decrypting the goal.
+
+Additional authenticated data binds request envelopes to `(grant ID, client request ID)` and response envelopes to `(grant ID, task ID, event kind)`. The gateway rejects a request if the encrypted permissions do not exactly match the relay-visible copy.
+
+Tasks can remain encrypted in the relay while the owner is offline. The gateway reconnects with exponential backoff, the relay reoffers unfinished tasks, and the in-process gateway prevents duplicate execution. Terminal events are replayed after reconnect. A relay restart currently loses all grants and tasks.
 
 ## Execution boundary
 
-Every task receives a detached temporary worktree at the repository's current `HEAD`. Uncommitted owner changes are intentionally excluded. After the agent exits:
+The gateway serializes tasks. After approval it:
 
-1. owner-configured validation commands run;
-2. `git diff --binary HEAD` captures the artifact;
-3. `git status --short` captures changed paths;
-4. the result is returned to the invoker;
-5. the temporary worktree is destroyed.
+1. creates a detached temporary worktree at repository `HEAD`;
+2. launches the selected agent with bounded time/output and a reduced environment;
+3. runs only owner-configured validators when `test` permission was requested;
+4. captures changed paths and `git diff --binary HEAD` under the grant's artifact limit;
+5. encrypts the structured result for the sender;
+6. destroys the worktree.
 
-`test` permission does not let the remote sender provide shell commands. It only enables validation commands chosen by the owner when the link is created.
+The returned patch is never applied automatically by ADL. The sender or sender agent must review it and choose whether to run `git apply`.
 
-## Adapter contract
+## Adapter boundary
 
-Adapters implement a single operation:
+Adapters implement:
 
 ```ts
-execute({ task, cwd, permissions, onProgress })
+execute({ task, cwd, permissions, timeoutMs, onProgress })
 ```
 
-Codex uses `codex exec --json` with an ephemeral session and the built-in sandbox. Claude uses print-mode stream JSON, safe mode, no session persistence, and an explicit tool set. The fake adapter makes integration tests deterministic and free of model usage.
+Codex uses an ephemeral JSONL `codex exec` session with ignored user config, `never` approval, and an OS-enforced `read-only` or `workspace-write` sandbox. Claude uses print-mode stream JSON, safe mode, no persistence, a constrained permission mode, and only `Read/Glob/Grep` plus `Edit/Write` when granted.
 
-## Planned protocol evolution
+## MCP boundary
 
-- MCP server for ergonomic invocation from Codex and Claude Code
-- end-to-end encrypted envelopes
-- signed agent identity and provenance
-- human approval callbacks
-- resumable task delivery
-- artifact upload separate from the message channel
-- optional A2A compatibility at the task envelope boundary
+`adl mcp` is a local stdio MCP server. It exposes `delegate_task` and `get_task`; it does not host a network MCP endpoint or store invitation links. Codex or Claude starts it as a child process, then passes a link on each tool call.
+
+## Audit boundary
+
+The local JSONL log stores no task or patch plaintext. Each record includes the previous record hash. This provides a locally verifiable integrity chain, not signer identity or protection against an attacker who can rewrite and rehash the entire log.

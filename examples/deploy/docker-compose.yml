@@ -1,0 +1,39 @@
+services:
+  relay:
+    build:
+      context: ../..
+    environment:
+      ADL_PUBLIC_BASE_URL: https://${ADL_DOMAIN:?Set ADL_DOMAIN}
+      ADL_RATE_LIMIT: ${ADL_RATE_LIMIT:-120}
+      ADL_RELAY_REGISTRATION_TOKEN: ${ADL_RELAY_REGISTRATION_TOKEN:?Set a strong registration token}
+    expose:
+      - "8787"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  caddy:
+    image: caddy:2.10-alpine
+    environment:
+      ADL_DOMAIN: ${ADL_DOMAIN:?Set ADL_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - relay
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  caddy_data:
+  caddy_config:

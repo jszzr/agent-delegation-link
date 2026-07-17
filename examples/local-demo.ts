@@ -29,7 +29,9 @@ const gateway = new DelegationGateway({
     permissions: ["read", "edit"],
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     maxTasks: 1,
-    approval: "auto_within_scope"
+    approval: "auto_within_scope",
+    maxTaskDurationSeconds: 60,
+    maxArtifactBytes: 1_000_000
   },
   onLog: (message) => console.error(`[demo gateway] ${message}`)
 });

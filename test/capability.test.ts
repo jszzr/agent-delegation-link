@@ -17,6 +17,18 @@ describe("capability links", () => {
     expect(new URL(link).hash).toContain("secret=");
   });
 
+  it("rejects cleartext public relay links", () => {
+    expect(() => parseInvitationUrl("http://relay.example/invite/0198a883-a515-7660-b999-d137ae97c99d#secret=x"))
+      .toThrow("must use HTTPS");
+  });
+
+  it("allows IPv6 loopback but rejects embedded URL credentials", () => {
+    expect(() => parseInvitationUrl("http://[::1]:8787/invite/0198a883-a515-7660-b999-d137ae97c99d#secret=x"))
+      .not.toThrow();
+    expect(() => parseInvitationUrl("https://user:pass@relay.example/invite/0198a883-a515-7660-b999-d137ae97c99d#secret=x"))
+      .toThrow("embedded credentials");
+  });
+
   it("verifies hashed secrets without storing the bearer value", () => {
     const secret = createSecret();
     expect(verifySecret(secret, hashSecret(secret))).toBe(true);
