@@ -1,23 +1,72 @@
 #!/usr/bin/env node
 import path from "node:path";
 import { readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stderr as output } from "node:process";
 import { Command, Option } from "commander";
 import { createAdapter } from "./adapters.js";
+import {
+  createRelayInvitation,
+  getRelayUser,
+  listRelayUsers,
+  registerRelayUser,
+  revokeRelayUser,
+  rotateRelayApiKey
+} from "./access-client.js";
 import { verifyAuditLog } from "./audit.js";
-import { parseDuration } from "./capability.js";
+import { assertSecureRelayOrigin, parseDuration } from "./capability.js";
+import {
+  DEFAULT_RELAY_ORIGIN,
+  getConfigPath,
+  requireEnvironment,
+  resolveRelaySettings,
+  saveConfig
+} from "./config.js";
 import { DelegationGateway, normalizePermissions } from "./gateway.js";
 import { submitTask, waitForTask } from "./invoke.js";
 import { startMcpServer } from "./mcp.js";
 import { agentKindSchema, type GrantPolicy, type StoredTask, type TaskRequest } from "./protocol.js";
 import { RelayServer } from "./relay.js";
+import type { ExecutionMode } from "./worktree.js";
 
-const VERSION = "0.2.0-alpha.2";
+const VERSION = "0.4.0-alpha.1";
 const program = new Command()
   .name("adl")
   .description("Encrypted task-scoped delegation links for Codex and Claude Code")
   .version(VERSION);
+
+interface QuickLinkOptions {
+  agent: string;
+  repo: string;
+  relay?: string;
+  mode: ExecutionMode;
+  permissions: string;
+  ttl: string;
+  taskTimeout: string;
+  label: string;
+  auditFile: string;
+  relayTokenEnv?: string;
+  apiKeyEnv?: string;
+  validate: string[];
+}
+
+interface ShareOptions extends QuickLinkOptions {
+  maxTasks: string;
+  maxArtifactMb: string;
+  approval: "ask_every_time" | "auto_within_scope";
+}
+
+interface InvokeOptions {
+  linkFile?: string;
+  patchFile?: string;
+  goal: string;
+  sender: string;
+  permissions: string;
+  constraint: string[];
+  acceptance: string[];
+  timeout: string;
+}
 
 program
   .command("relay")
@@ -27,13 +76,19 @@ program
   .option("--public-base-url <url>", "HTTPS public URL embedded in invitation links")
   .option("--rate-limit <count>", "maximum requests per source IP per minute", "120")
   .option("--trust-proxy", "trust X-Forwarded-For from a configured reverse proxy", false)
-  .option("--registration-token-env <name>", "environment variable required for creating grants")
+  .option("--admin-token-env <name>", "environment variable containing the access administrator token")
+  .option("--access-file <path>", "persistent user and invitation state file")
+  .option("--access-audit-file <path>", "hash-chained access audit log")
+  .option("--registration-token-env <name>", "legacy shared token environment variable")
   .action(async (options: {
     host: string;
     port: string;
     publicBaseUrl?: string;
     rateLimit: string;
     trustProxy: boolean;
+    adminTokenEnv?: string;
+    accessFile?: string;
+    accessAuditFile?: string;
     registrationTokenEnv?: string;
   }) => {
     const loopback = options.host === "127.0.0.1" || options.host === "localhost" || options.host === "::1";
@@ -41,6 +96,15 @@ program
       throw new Error("--public-base-url https://... is required when listening beyond loopback");
     }
     const relay = new RelayServer();
+    if (options.adminTokenEnv && options.registrationTokenEnv) {
+      throw new Error("Use --admin-token-env for access control or --registration-token-env for legacy mode, not both");
+    }
+    if (options.accessFile && !options.adminTokenEnv) {
+      throw new Error("--access-file requires --admin-token-env");
+    }
+    const adminToken = options.adminTokenEnv === undefined
+      ? undefined
+      : requireEnvironment(options.adminTokenEnv);
     const registrationToken = options.registrationTokenEnv === undefined
       ? undefined
       : requireEnvironment(options.registrationTokenEnv);
@@ -49,6 +113,9 @@ program
       port: Number(options.port),
       maxRequestsPerMinute: Number(options.rateLimit),
       trustProxy: options.trustProxy,
+      ...(adminToken === undefined ? {} : { adminToken }),
+      ...(options.accessFile === undefined ? {} : { accessFile: path.resolve(options.accessFile) }),
+      ...(options.accessAuditFile === undefined ? {} : { accessAuditFile: path.resolve(options.accessAuditFile) }),
       ...(registrationToken === undefined ? {} : { registrationToken }),
       onLog: (message) => console.error(`[relay] ${message}`),
       ...(options.publicBaseUrl === undefined ? {} : { publicBaseUrl: options.publicBaseUrl })
@@ -63,11 +130,160 @@ program
   });
 
 program
+  .command("setup")
+  .description("Save a legacy shared Relay token (self-hosted compatibility mode)")
+  .option("--relay <url>", "Relay origin", DEFAULT_RELAY_ORIGIN)
+  .requiredOption("--token-env <name>", "environment variable containing the Relay registration token")
+  .action(async (options: { relay: string; tokenEnv: string }) => {
+    assertSecureRelayOrigin(options.relay);
+    const configPath = getConfigPath();
+    await saveConfig({
+      relayOrigin: options.relay,
+      relayRegistrationToken: requireEnvironment(options.tokenEnv)
+    }, configPath);
+    console.log(`ADL is configured for ${options.relay}`);
+    console.log(`Credentials saved with owner-only permissions at ${configPath}`);
+  });
+
+program
+  .command("register")
+  .description("Exchange a one-use invitation code for this device's Relay API key")
+  .argument("[invitation-code]", "one-use code; prefer ADL_INVITE_CODE to keep it out of shell history")
+  .option("--invite-env <name>", "environment variable containing the invitation code", "ADL_INVITE_CODE")
+  .option("--relay <url>", "override the configured Relay origin")
+  .option("--name <name>", "device or user label", os.hostname())
+  .action(async (invitationCode: string | undefined, options: { inviteEnv: string; relay?: string; name: string }) => {
+    const code = invitationCode ?? requireEnvironment(options.inviteEnv);
+    const relay = await resolveRelaySettings({
+      ...(options.relay === undefined ? {} : { relayOrigin: options.relay })
+    });
+    const registration = await registerRelayUser(relay.relayOrigin, code, options.name);
+    const configPath = getConfigPath();
+    await saveConfig({ relayOrigin: relay.relayOrigin, relayApiKey: registration.apiKey }, configPath);
+    console.log(`Registered ${registration.user.displayName} with ${relay.relayOrigin}`);
+    console.log(`Device API key saved with owner-only permissions at ${configPath}`);
+  });
+
+const access = program.command("access").description("Manage Relay invitations and user access");
+
+access
+  .command("invite")
+  .description("Create a one-use user invitation (Relay administrator)")
+  .option("--relay <url>", "override the configured Relay origin")
+  .option("--admin-token-env <name>", "environment variable containing the Relay admin token", "ADL_RELAY_ADMIN_TOKEN")
+  .option("--label <label>", "invitation label", "collaborator")
+  .option("--ttl <duration>", "invitation lifetime", "24h")
+  .option("--max-active-grants <count>", "maximum concurrently active links", "5")
+  .option("--max-grants-per-hour <count>", "maximum links created per hour", "20")
+  .action(async (options: {
+    relay?: string;
+    adminTokenEnv: string;
+    label: string;
+    ttl: string;
+    maxActiveGrants: string;
+    maxGrantsPerHour: string;
+  }) => {
+    const relayOrigin = await resolveRelayOrigin(options.relay);
+    const invitation = await createRelayInvitation(relayOrigin, requireEnvironment(options.adminTokenEnv), {
+      label: options.label,
+      expiresInSeconds: Math.ceil(parseDuration(options.ttl) / 1_000),
+      maxActiveGrants: parsePositiveInteger(options.maxActiveGrants, "--max-active-grants"),
+      maxGrantsPerHour: parsePositiveInteger(options.maxGrantsPerHour, "--max-grants-per-hour")
+    });
+    console.log("One-use Relay invitation code (share only with the intended user):");
+    console.log(invitation.invitationCode);
+    console.log(`Expires: ${invitation.expiresAt}`);
+  });
+
+access
+  .command("whoami")
+  .description("Show the registered Relay user and current quotas")
+  .option("--relay <url>", "override the configured Relay origin")
+  .option("--api-key-env <name>", "override the saved API key with an environment variable")
+  .action(async (options: { relay?: string; apiKeyEnv?: string }) => {
+    const relay = await resolveRelaySettings({
+      ...(options.relay === undefined ? {} : { relayOrigin: options.relay }),
+      ...(options.apiKeyEnv === undefined ? {} : { relayApiKeyEnvironment: options.apiKeyEnv })
+    });
+    if (!relay.relayApiKey) throw new Error("This device is not registered; run adl register first");
+    console.log(JSON.stringify(await getRelayUser(relay.relayOrigin, relay.relayApiKey), null, 2));
+  });
+
+access
+  .command("rotate")
+  .description("Rotate this device's Relay API key")
+  .option("--relay <url>", "override the configured Relay origin")
+  .option("--api-key-env <name>", "override the saved API key with an environment variable")
+  .action(async (options: { relay?: string; apiKeyEnv?: string }) => {
+    const relay = await resolveRelaySettings({
+      ...(options.relay === undefined ? {} : { relayOrigin: options.relay }),
+      ...(options.apiKeyEnv === undefined ? {} : { relayApiKeyEnvironment: options.apiKeyEnv })
+    });
+    if (!relay.relayApiKey) throw new Error("This device is not registered; run adl register first");
+    const registration = await rotateRelayApiKey(relay.relayOrigin, relay.relayApiKey);
+    const configPath = getConfigPath();
+    await saveConfig({ relayOrigin: relay.relayOrigin, relayApiKey: registration.apiKey }, configPath);
+    console.log(`API key rotated and saved at ${configPath}`);
+  });
+
+access
+  .command("users")
+  .description("List registered Relay users (Relay administrator)")
+  .option("--relay <url>", "override the configured Relay origin")
+  .option("--admin-token-env <name>", "environment variable containing the Relay admin token", "ADL_RELAY_ADMIN_TOKEN")
+  .action(async (options: { relay?: string; adminTokenEnv: string }) => {
+    console.log(JSON.stringify(await listRelayUsers(
+      await resolveRelayOrigin(options.relay),
+      requireEnvironment(options.adminTokenEnv)
+    ), null, 2));
+  });
+
+access
+  .command("revoke")
+  .description("Revoke a user API key and all of their active links (Relay administrator)")
+  .argument("<user-id>", "user UUID from adl access users")
+  .option("--relay <url>", "override the configured Relay origin")
+  .option("--admin-token-env <name>", "environment variable containing the Relay admin token", "ADL_RELAY_ADMIN_TOKEN")
+  .action(async (userId: string, options: { relay?: string; adminTokenEnv: string }) => {
+    const user = await revokeRelayUser(
+      await resolveRelayOrigin(options.relay),
+      requireEnvironment(options.adminTokenEnv),
+      userId
+    );
+    console.log(`Revoked ${user.displayName} (${user.id})`);
+  });
+
+program
+  .command("link")
+  .description("Create a one-task link using safe, useful defaults")
+  .option("--agent <agent>", "codex or claude", "codex")
+  .option("--repo <path>", "directory delegated to the agent", process.cwd())
+  .option("--relay <url>", "override the configured Relay origin")
+  .addOption(new Option("--mode <mode>", "direct edits or isolated worktree patch").choices(["direct", "worktree"]).default("direct"))
+  .option("--permissions <list>", "comma-separated permissions", "read,edit")
+  .option("--ttl <duration>", "link lifetime", "15m")
+  .option("--task-timeout <duration>", "maximum task duration", "10m")
+  .option("--label <label>", "human-readable grant label", "quick-link")
+  .option("--audit-file <path>", "hash-chained audit log", ".adl/audit.jsonl")
+  .option("--relay-token-env <name>", "override the saved token with an environment variable")
+  .option("--api-key-env <name>", "override the saved user API key with an environment variable")
+  .option("--validate <command>", "owner-defined validation command; repeatable", collect, [])
+  .action(async (options: QuickLinkOptions) => {
+    await startGateway({
+      ...options,
+      maxTasks: "1",
+      maxArtifactMb: "2",
+      approval: "ask_every_time"
+    });
+  });
+
+program
   .command("share")
   .description("Share a task-scoped capability to a local coding agent")
   .requiredOption("--agent <agent>", "codex, claude, or fake")
-  .option("--relay <url>", "relay origin", "http://127.0.0.1:8787")
-  .option("--repo <path>", "Git repository delegated to the agent", process.cwd())
+  .option("--relay <url>", "override the configured Relay origin")
+  .option("--repo <path>", "directory delegated to the agent", process.cwd())
+  .addOption(new Option("--mode <mode>", "direct edits or isolated worktree patch").choices(["direct", "worktree"]).default("worktree"))
   .option("--permissions <list>", "comma-separated permissions", "read,edit")
   .option("--ttl <duration>", "link lifetime", "30m")
   .option("--max-tasks <count>", "maximum accepted tasks", "1")
@@ -77,105 +293,12 @@ program
   .addOption(new Option("--approval <mode>", "owner approval policy").choices(["ask_every_time", "auto_within_scope"]).default("ask_every_time"))
   .option("--audit-file <path>", "hash-chained audit log", ".adl/audit.jsonl")
   .option("--relay-token-env <name>", "environment variable containing the relay registration token")
+  .option("--api-key-env <name>", "environment variable containing a Relay user API key")
   .option("--validate <command>", "owner-defined validation command; repeatable", collect, [])
-  .action(async (options: {
-    agent: string;
-    relay: string;
-    repo: string;
-    permissions: string;
-    ttl: string;
-    maxTasks: string;
-    taskTimeout: string;
-    maxArtifactMb: string;
-    label: string;
-    approval: "ask_every_time" | "auto_within_scope";
-    auditFile: string;
-    relayTokenEnv?: string;
-    validate: string[];
-  }) => {
-    const agent = agentKindSchema.parse(options.agent);
-    const permissions = normalizePermissions([options.permissions]);
-    const repoPath = path.resolve(options.repo);
-    const policy: GrantPolicy = {
-      label: options.label,
-      agent,
-      permissions,
-      expiresAt: new Date(Date.now() + parseDuration(options.ttl)).toISOString(),
-      maxTasks: Number(options.maxTasks),
-      approval: options.approval,
-      maxTaskDurationSeconds: Math.ceil(parseDuration(options.taskTimeout) / 1_000),
-      maxArtifactBytes: Math.floor(Number(options.maxArtifactMb) * 1_048_576)
-    };
-    const gateway = new DelegationGateway({
-      relayOrigin: options.relay,
-      repoPath,
-      adapter: createAdapter(agent),
-      validationCommands: options.validate,
-      policy,
-      auditFile: path.resolve(repoPath, options.auditFile),
-      ...(options.relayTokenEnv === undefined
-        ? {}
-        : { relayRegistrationToken: requireEnvironment(options.relayTokenEnv) }),
-      ...(options.approval === "ask_every_time" ? { approveTask: promptForApproval } : {}),
-      onLog: (message) => console.error(`[gateway] ${message}`)
-    });
-    const { invitationUrl } = await gateway.start();
-    console.log("Delegation link (treat the complete URL as a secret):");
-    console.log(invitationUrl);
-    console.log(`Approval: ${options.approval}. Gateway is waiting; Ctrl-C revokes the link.`);
-    const shutdown = async () => {
-      await gateway.stop();
-      process.exit(0);
-    };
-    process.once("SIGINT", () => void shutdown());
-    process.once("SIGTERM", () => void shutdown());
-  });
+  .action(async (options: ShareOptions) => startGateway(options));
 
-program
-  .command("invoke")
-  .description("Delegate a task through an invitation link")
-  .argument("[invitation-url]")
-  .option("--link-file <path>", "read the invitation URL from a local file to avoid shell history")
-  .option("--patch-file <path>", "write the returned patch to this file without applying it")
-  .requiredOption("--goal <goal>", "task goal")
-  .option("--sender <name>", "sender identity", "remote-agent")
-  .option("--permissions <list>", "requested permissions", "read,edit")
-  .option("--constraint <text>", "constraint; repeatable", collect, [])
-  .option("--acceptance <text>", "acceptance criterion; repeatable", collect, [])
-  .addOption(new Option("--timeout <duration>", "wait timeout").default("10m"))
-  .action(async (invitationUrl: string | undefined, options: {
-    linkFile?: string;
-    patchFile?: string;
-    goal: string;
-    sender: string;
-    permissions: string;
-    constraint: string[];
-    acceptance: string[];
-    timeout: string;
-  }) => {
-    const resolvedInvitationUrl = await resolveInvitationUrl(invitationUrl, options.linkFile);
-    const requestedPermissions = normalizePermissions([options.permissions]);
-    const submitted = await submitTask(resolvedInvitationUrl, {
-      goal: options.goal,
-      sender: options.sender,
-      requestedPermissions,
-      constraints: options.constraint,
-      acceptanceCriteria: options.acceptance
-    });
-    console.error(`Task accepted: ${submitted.taskId}`);
-    if (!submitted.gatewayOnline) console.error("Gateway is currently offline; the encrypted task is queued.");
-    const task = await waitForTask(resolvedInvitationUrl, submitted.taskId, {
-      timeoutMs: parseDuration(options.timeout),
-      onProgress: (message) => console.error(`[progress] ${message}`)
-    });
-    printTask(task);
-    if (options.patchFile && task.result) {
-      const patchFile = path.resolve(options.patchFile);
-      await writeFile(patchFile, task.result.patch, { encoding: "utf8", mode: 0o600 });
-      console.error(`Patch written to ${patchFile}; review it before running git apply.`);
-    }
-    if (task.status === "failed") process.exitCode = 1;
-  });
+registerInvokeCommand("send", "Send a task through an invitation link");
+registerInvokeCommand("invoke", "Delegate a task through an invitation link (advanced alias)");
 
 program
   .command("mcp")
@@ -191,6 +314,96 @@ audit
     console.log(JSON.stringify(result, null, 2));
     if (!result.valid) process.exitCode = 1;
   });
+
+async function startGateway(options: ShareOptions): Promise<void> {
+  const agent = agentKindSchema.parse(options.agent);
+  const permissions = normalizePermissions([options.permissions]);
+  const repoPath = path.resolve(options.repo);
+  const relay = await resolveRelaySettings({
+    ...(options.relay === undefined ? {} : { relayOrigin: options.relay }),
+    ...(options.relayTokenEnv === undefined ? {} : { relayTokenEnvironment: options.relayTokenEnv }),
+    ...(options.apiKeyEnv === undefined ? {} : { relayApiKeyEnvironment: options.apiKeyEnv })
+  });
+  const policy: GrantPolicy = {
+    label: options.label,
+    agent,
+    permissions,
+    expiresAt: new Date(Date.now() + parseDuration(options.ttl)).toISOString(),
+    maxTasks: Number(options.maxTasks),
+    approval: options.approval,
+    maxTaskDurationSeconds: Math.ceil(parseDuration(options.taskTimeout) / 1_000),
+    maxArtifactBytes: Math.floor(Number(options.maxArtifactMb) * 1_048_576)
+  };
+  const gateway = new DelegationGateway({
+    relayOrigin: relay.relayOrigin,
+    repoPath,
+    executionMode: options.mode,
+    adapter: createAdapter(agent),
+    validationCommands: options.validate,
+    policy,
+    auditFile: path.resolve(repoPath, options.auditFile),
+    ...(relay.relayRegistrationToken === undefined
+      ? {}
+      : { relayRegistrationToken: relay.relayRegistrationToken }),
+    ...(relay.relayApiKey === undefined ? {} : { relayApiKey: relay.relayApiKey }),
+    ...(options.approval === "ask_every_time" ? { approveTask: promptForApproval } : {}),
+    onLog: (message) => console.error(`[gateway] ${message}`)
+  });
+  const { invitationUrl } = await gateway.start();
+  if (options.mode === "direct") {
+    console.error("Direct mode: approved tasks modify the selected directory immediately; no Git HEAD or patch is required.");
+  }
+  console.log("Delegation link (treat the complete URL as a secret):");
+  console.log(invitationUrl);
+  console.log(`Mode: ${options.mode}. Approval: ${options.approval}. Ctrl-C revokes the link.`);
+  const shutdown = async () => {
+    await gateway.stop();
+    process.exit(0);
+  };
+  process.once("SIGINT", () => void shutdown());
+  process.once("SIGTERM", () => void shutdown());
+}
+
+function registerInvokeCommand(name: string, description: string): void {
+  program
+    .command(name)
+    .description(description)
+    .argument("[invitation-url]")
+    .option("--link-file <path>", "read the invitation URL from a local file to avoid shell history")
+    .option("--patch-file <path>", "write a returned worktree patch without applying it")
+    .requiredOption("--goal <goal>", "task goal")
+    .option("--sender <name>", "sender identity", "remote-agent")
+    .option("--permissions <list>", "requested permissions", "read,edit")
+    .option("--constraint <text>", "constraint; repeatable", collect, [])
+    .option("--acceptance <text>", "acceptance criterion; repeatable", collect, [])
+    .addOption(new Option("--timeout <duration>", "wait timeout").default("10m"))
+    .action(async (invitationUrl: string | undefined, options: InvokeOptions) => {
+      const resolvedInvitationUrl = await resolveInvitationUrl(invitationUrl, options.linkFile);
+      const requestedPermissions = normalizePermissions([options.permissions]);
+      const submitted = await submitTask(resolvedInvitationUrl, {
+        goal: options.goal,
+        sender: options.sender,
+        requestedPermissions,
+        constraints: options.constraint,
+        acceptanceCriteria: options.acceptance
+      });
+      console.error(`Task accepted: ${submitted.taskId}`);
+      if (!submitted.gatewayOnline) console.error("Gateway is currently offline; the encrypted task is queued.");
+      const task = await waitForTask(resolvedInvitationUrl, submitted.taskId, {
+        timeoutMs: parseDuration(options.timeout),
+        onProgress: (message) => console.error(`[progress] ${message}`)
+      });
+      printTask(task);
+      if (options.patchFile && task.result?.patch) {
+        const patchFile = path.resolve(options.patchFile);
+        await writeFile(patchFile, task.result.patch, { encoding: "utf8", mode: 0o600 });
+        console.error(`Patch written to ${patchFile}; review it before running git apply.`);
+      } else if (options.patchFile && task.result?.executionMode === "direct") {
+        console.error("No patch was written because direct mode changed the owner's directory in place.");
+      }
+      if (task.status === "failed") process.exitCode = 1;
+    });
+}
 
 async function promptForApproval(task: TaskRequest, context: { taskId: string; policy: GrantPolicy }): Promise<boolean> {
   console.error("\nIncoming delegated task");
@@ -215,17 +428,25 @@ function collect(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
+async function resolveRelayOrigin(override: string | undefined): Promise<string> {
+  const relay = await resolveRelaySettings({
+    ...(override === undefined ? {} : { relayOrigin: override })
+  });
+  assertSecureRelayOrigin(relay.relayOrigin);
+  return relay.relayOrigin;
+}
+
+function parsePositiveInteger(value: string, option: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${option} must be a positive integer`);
+  return parsed;
+}
+
 async function resolveInvitationUrl(argument: string | undefined, linkFile: string | undefined): Promise<string> {
   if ((argument === undefined) === (linkFile === undefined)) {
     throw new Error("Provide exactly one invitation URL argument or --link-file <path>");
   }
   return argument ?? (await readFile(path.resolve(linkFile!), "utf8")).trim();
-}
-
-function requireEnvironment(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`Environment variable ${name} is required and must not be empty`);
-  return value;
 }
 
 function printTask(task: StoredTask): void {

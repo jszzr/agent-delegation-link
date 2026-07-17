@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
+import {
+  createAccessInvitationRequestSchema,
+  registerAccessRequestSchema,
+  RelayAccessStore
+} from "./access.js";
 import { assertSecureRelayOrigin, createSecret, hashSecret, verifySecret } from "./capability.js";
 import {
   createGrantRequestSchema,
@@ -19,6 +24,8 @@ interface GrantRecord {
   acceptedTasks: number;
   clientRequests: Map<string, string>;
   revoked: boolean;
+  creatorUserId?: string;
+  quotaReleased: boolean;
 }
 
 interface RateBucket {
@@ -85,6 +92,9 @@ export interface RelayStartOptions {
   maxRequestsPerMinute?: number;
   trustProxy?: boolean;
   registrationToken?: string;
+  adminToken?: string;
+  accessFile?: string;
+  accessAuditFile?: string;
   onLog?: (message: string) => void;
 }
 
@@ -93,13 +103,15 @@ export class RelayServer {
   private readonly tasks = new Map<string, RelayStoredTask>();
   private readonly gateways = new Map<string, LiveWebSocket>();
   private readonly rateBuckets = new Map<string, RateBucket>();
+  private readonly featureRateBuckets = new Map<string, RateBucket>();
   private server: Server | undefined;
   private websocketServer: WebSocketServer | undefined;
   private heartbeat: NodeJS.Timeout | undefined;
   private publicBaseUrl: string | undefined;
   private maxRequestsPerMinute = 120;
   private trustProxy = false;
-  private registrationTokenHash: string | undefined;
+  private adminTokenHash: string | undefined;
+  private accessStore: RelayAccessStore | undefined;
   private onLog: ((message: string) => void) | undefined;
 
   async start(options: RelayStartOptions = {}): Promise<RelayAddress> {
@@ -107,7 +119,13 @@ export class RelayServer {
     const host = options.host ?? "127.0.0.1";
     this.maxRequestsPerMinute = options.maxRequestsPerMinute ?? 120;
     this.trustProxy = options.trustProxy ?? false;
-    this.registrationTokenHash = options.registrationToken === undefined ? undefined : hashSecret(options.registrationToken);
+    const adminToken = options.adminToken ?? options.registrationToken;
+    this.adminTokenHash = adminToken === undefined ? undefined : hashSecret(adminToken);
+    if (options.accessFile && !adminToken) throw new Error("Relay access control requires an admin token");
+    if (options.accessAuditFile && !options.accessFile) throw new Error("accessAuditFile requires accessFile");
+    this.accessStore = options.accessFile === undefined
+      ? undefined
+      : await RelayAccessStore.open(options.accessFile, options.accessAuditFile);
     this.onLog = options.onLog;
     if (options.publicBaseUrl) assertSecureRelayOrigin(options.publicBaseUrl);
     this.server = createServer((request, response) => {
@@ -160,9 +178,12 @@ export class RelayServer {
     this.gateways.clear();
     this.websocketServer?.close();
     this.websocketServer = undefined;
-    if (!this.server) return;
-    await new Promise<void>((resolve, reject) => this.server!.close((error) => (error ? reject(error) : resolve())));
-    this.server = undefined;
+    if (this.server) {
+      await new Promise<void>((resolve, reject) => this.server!.close((error) => (error ? reject(error) : resolve())));
+      this.server = undefined;
+    }
+    await this.accessStore?.flush();
+    this.accessStore = undefined;
   }
 
   dropGatewayConnection(grantId: string): boolean {
@@ -198,10 +219,85 @@ export class RelayServer {
       return;
     }
 
+    if (method === "POST" && url.pathname === "/v1/access/register") {
+      if (!this.accessStore) {
+        sendJson(response, 404, { error: "access_disabled", message: "Relay user registration is not enabled" });
+        return;
+      }
+      if (!this.consumeFeatureRateLimit(request, "register", 10)) {
+        sendJson(response, 429, { error: "rate_limited", message: "Too many registration attempts" });
+        return;
+      }
+      const parsed = registerAccessRequestSchema.safeParse(await readJson(request, 16_000));
+      if (!parsed.success) {
+        sendJson(response, 400, { error: "invalid_registration", message: "Invalid invitation code or display name" });
+        return;
+      }
+      const registration = await this.accessStore.register(parsed.data.invitationCode, parsed.data.displayName);
+      if (!registration) {
+        sendJson(response, 401, { error: "invalid_invitation", message: "Invitation code is invalid, expired, or already used" });
+        return;
+      }
+      sendJson(response, 201, registration);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/access/me") {
+      const user = this.accessStore?.authenticate(bearerToken(request));
+      if (!user) {
+        sendJson(response, 401, { error: "unauthorized", message: "A valid user API key is required" });
+        return;
+      }
+      sendJson(response, 200, { user });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/v1/access/rotate") {
+      const rotated = await this.accessStore?.rotateApiKey(bearerToken(request));
+      if (!rotated) {
+        sendJson(response, 401, { error: "unauthorized", message: "A valid user API key is required" });
+        return;
+      }
+      sendJson(response, 200, rotated);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/v1/admin/invitations") {
+      if (!this.requireAdmin(request, response) || !this.accessStore) return;
+      const parsed = createAccessInvitationRequestSchema.safeParse(await readJson(request, 16_000));
+      if (!parsed.success) {
+        sendJson(response, 400, { error: "invalid_invitation", message: parsed.error.message });
+        return;
+      }
+      sendJson(response, 201, await this.accessStore.createInvitation(parsed.data));
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/v1/admin/users") {
+      if (!this.requireAdmin(request, response) || !this.accessStore) return;
+      sendJson(response, 200, { users: this.accessStore.listUsers() });
+      return;
+    }
+
+    const revokeUserMatch = url.pathname.match(/^\/v1\/admin\/users\/([0-9a-f-]{36})$/i);
+    if (method === "DELETE" && revokeUserMatch?.[1]) {
+      if (!this.requireAdmin(request, response) || !this.accessStore) return;
+      const user = await this.accessStore.revokeUser(revokeUserMatch[1]);
+      if (!user) {
+        sendJson(response, 404, { error: "user_not_found", message: "User not found" });
+        return;
+      }
+      for (const grant of this.grants.values()) {
+        if (grant.creatorUserId === user.id && !grant.revoked) await this.revokeGrant(grant, "user_revoked");
+      }
+      sendJson(response, 200, { user });
+      return;
+    }
+
     if (method === "POST" && url.pathname === "/v1/grants") {
-      if (this.registrationTokenHash) {
+      if (!this.accessStore && this.adminTokenHash) {
         const registrationToken = request.headers["x-adl-relay-token"];
-        if (typeof registrationToken !== "string" || !verifySecret(registrationToken, this.registrationTokenHash)) {
+        if (typeof registrationToken !== "string" || !verifySecret(registrationToken, this.adminTokenHash)) {
           sendJson(response, 401, { error: "registration_required", message: "A valid relay registration token is required" });
           return;
         }
@@ -219,6 +315,19 @@ export class RelayServer {
         sendJson(response, 409, { error: "grant_exists", message: "Grant already exists" });
         return;
       }
+      let creatorUserId: string | undefined;
+      if (this.accessStore) {
+        const quota = await this.accessStore.consumeGrant(bearerToken(request), parsed.data.grantId);
+        if (!quota) {
+          sendJson(response, 401, { error: "user_api_key_required", message: "Register this device with an invitation code before creating links" });
+          return;
+        }
+        if (!quota.allowed) {
+          sendJson(response, 429, { error: quota.code, message: quota.message });
+          return;
+        }
+        creatorUserId = quota.user.id;
+      }
       const ownerToken = createSecret();
       this.grants.set(parsed.data.grantId, {
         id: parsed.data.grantId,
@@ -227,7 +336,9 @@ export class RelayServer {
         policy: parsed.data.policy,
         acceptedTasks: 0,
         clientRequests: new Map(),
-        revoked: false
+        revoked: false,
+        ...(creatorUserId === undefined ? {} : { creatorUserId }),
+        quotaReleased: false
       });
       sendJson(response, 201, { grantId: parsed.data.grantId, ownerToken });
       return;
@@ -309,8 +420,7 @@ export class RelayServer {
         sendJson(response, 401, { error: "unauthorized", message: "Invalid owner token" });
         return;
       }
-      grant.revoked = true;
-      this.gateways.get(grant.id)?.close(1000, "Grant revoked");
+      await this.revokeGrant(grant, "owner_revoked");
       sendJson(response, 200, { revoked: true });
       return;
     }
@@ -406,6 +516,14 @@ export class RelayServer {
     for (const [key, bucket] of this.rateBuckets) {
       if (bucket.startedAt < expiry) this.rateBuckets.delete(key);
     }
+    for (const [key, bucket] of this.featureRateBuckets) {
+      if (bucket.startedAt < expiry) this.featureRateBuckets.delete(key);
+    }
+    for (const grant of this.grants.values()) {
+      if (!grant.revoked && Date.parse(grant.policy.expiresAt) <= Date.now()) {
+        void this.revokeGrant(grant, "expired");
+      }
+    }
   }
 
   private isGatewayOnline(grantId: string): boolean {
@@ -413,17 +531,52 @@ export class RelayServer {
   }
 
   private consumeRateLimit(request: IncomingMessage): boolean {
+    return this.consumeBucket(this.rateBuckets, this.clientKey(request), this.maxRequestsPerMinute);
+  }
+
+  private consumeFeatureRateLimit(request: IncomingMessage, feature: string, limit: number): boolean {
+    return this.consumeBucket(this.featureRateBuckets, `${feature}:${this.clientKey(request)}`, limit);
+  }
+
+  private clientKey(request: IncomingMessage): string {
     const forwarded = this.trustProxy ? request.headers["x-forwarded-for"] : undefined;
-    const key = (Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0]?.trim())
+    return (Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0]?.trim())
       ?? request.socket.remoteAddress
       ?? "unknown";
+  }
+
+  private consumeBucket(buckets: Map<string, RateBucket>, key: string, limit: number): boolean {
     const now = Date.now();
-    const existing = this.rateBuckets.get(key);
+    const existing = buckets.get(key);
     if (!existing || now - existing.startedAt >= 60_000) {
-      this.rateBuckets.set(key, { startedAt: now, count: 1 });
+      buckets.set(key, { startedAt: now, count: 1 });
       return true;
     }
     existing.count += 1;
-    return existing.count <= this.maxRequestsPerMinute;
+    return existing.count <= limit;
+  }
+
+  private requireAdmin(request: IncomingMessage, response: ServerResponse): boolean {
+    if (!this.accessStore || !this.adminTokenHash) {
+      sendJson(response, 404, { error: "access_disabled", message: "Relay access administration is not enabled" });
+      return false;
+    }
+    const token = bearerToken(request);
+    if (!token || !verifySecret(token, this.adminTokenHash)) {
+      sendJson(response, 401, { error: "unauthorized", message: "A valid Relay admin token is required" });
+      return false;
+    }
+    return true;
+  }
+
+  private async revokeGrant(grant: GrantRecord, reason: string): Promise<void> {
+    grant.revoked = true;
+    this.gateways.get(grant.id)?.close(1000, "Grant revoked");
+    if (grant.creatorUserId && !grant.quotaReleased) {
+      grant.quotaReleased = true;
+      await this.accessStore?.releaseGrant(grant.creatorUserId, grant.id, reason).catch((error) => {
+        this.onLog?.(`Unable to release user grant quota: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
   }
 }

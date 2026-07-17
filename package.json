@@ -1,12 +1,13 @@
 {
   "name": "agent-delegation-link",
-  "version": "0.2.0-alpha.2",
+  "version": "0.4.0-alpha.1",
   "description": "Task-scoped delegation links for user-owned Codex and Claude Code agents.",
   "type": "module",
   "private": true,
   "license": "MIT",
   "files": [
     "dist",
+    ".agents/skills/delegate-to-agent",
     "README.md",
     "SECURITY.md",
     "LICENSE",
@@ -23,7 +24,7 @@
     "demo": "tsx examples/local-demo.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepack": "npm run build"
+    "prepare": "npm run build"
   },
   "engines": {
     "node": ">=22"

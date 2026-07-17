@@ -1,6 +1,6 @@
 # Security model
 
-Version `0.2.0-alpha.2` is intended for controlled tests between trusted collaborators on non-sensitive repositories. Do not give links to anonymous users, execute tasks from people you do not trust, or treat this as a hardened sandbox for hostile code.
+Version `0.4.0-alpha.1` is intended for controlled tests between trusted collaborators on non-sensitive directories. Do not give links to anonymous users, execute tasks from people you do not trust, or treat this as a hardened sandbox for hostile code.
 
 ## What the alpha protects
 
@@ -20,25 +20,28 @@ The relay still sees routing metadata: grant policy, requested permission names,
 - links expire, have a maximum task count, and are revoked when the gateway stops;
 - replayed submissions use a UUID idempotency key and do not consume another task slot;
 - the relay and gateway independently check requested permissions;
-- public deployment can require an operator registration token before a user creates grants;
-- request bodies, WebSocket messages, progress history, process output, patch size, and execution duration are bounded;
+- a public deployment can require one-use operator invitations and per-user API keys before a user creates grants;
+- each user has limits on concurrently active grants and grants created per hour; an operator can revoke a user and all of that user's active grants;
+- request bodies, WebSocket messages, progress history, process output, patch size, direct-workspace inspection, and execution duration are bounded;
 - the relay applies per-source-IP rate limits and heartbeat-based dead-connection cleanup.
 
-The relay is currently in-memory. Its rate limiter and replay state do not survive restart and do not stop a distributed denial-of-service attack.
+Relay user records, invitation state, hourly grant timestamps, and the access audit persist. Active grants, tasks, IP rate buckets, and replay state remain in memory and do not survive restart. These controls do not stop a distributed denial-of-service attack.
 
 ### Local execution boundary
 
 - owner confirmation is required for every task by default; non-interactive approval fails closed;
-- each task uses a detached temporary Git worktree at committed `HEAD`;
-- uncommitted owner changes are excluded and the original checkout is not modified;
+- worktree mode uses a detached temporary Git worktree at committed `HEAD`; uncommitted owner changes are excluded and the original checkout is not modified;
+- direct mode does not require Git or `HEAD` and edits the selected owner directory in place, so it is restricted to per-task interactive approval;
 - validation commands are chosen by the owner when sharing, never by the remote sender;
-- edit requests that produce no patch and owner validations that exit nonzero fail closed;
+- worktree edit requests that produce no patch, direct edit requests with no detected changed path, and owner validations that exit nonzero fail closed;
 - child processes inherit an environment allowlist rather than the complete environment;
 - Codex runs ephemerally, ignores user config, uses `read-only` or `workspace-write` sandboxing, disables interactive escalation, and does not enable web search;
 - Linux owners must provide a working Bubblewrap/AppArmor user-namespace profile; do not bypass a sandbox initialization failure with `danger-full-access`;
 - Claude runs in safe mode without session persistence and receives only explicit file tools; Bash and web tools are not granted.
 
-The worktree is edit isolation, not a complete OS security boundary. The CLIs still need local authentication, and Claude's file-tool restrictions are not equivalent to a container or VM. A compromised agent runtime or undiscovered CLI escape may access more of the host than intended. Use a disposable OS account or VM for higher-risk testing.
+The worktree is edit isolation, not a complete OS security boundary. Direct mode provides even less isolation: changes happen before validation, failed tasks are not rolled back, and its changed-path snapshot intentionally excludes `.git`, `.adl`, and `node_modules`. The CLIs still need local authentication, and Claude's file-tool restrictions are not equivalent to a container or VM. A compromised agent runtime or undiscovered CLI escape may access more of the host than intended. Use a disposable OS account or VM for higher-risk testing.
+
+`adl register` stores that device's user API key as plaintext in the local ADL config because the gateway must send it when creating a grant. On POSIX systems ADL creates and requires mode `0600`; never commit, share, or copy this config into a synchronized public folder. The Relay stores only SHA-256 credential hashes. Its administrator token is separate, can only call access-management endpoints, and must never be distributed to ordinary users.
 
 ### Audit
 
@@ -59,9 +62,9 @@ The complete invitation URL is a bearer credential. Anyone who has it can consum
 
 ## Public relay requirements
 
-ADL refuses non-loopback plain HTTP URLs. Put the relay behind HTTPS/WSS, keep its container port private to the reverse proxy, enable a strong registration token, and set rate limits. The supplied Caddy deployment runs the relay read-only as an unprivileged user with all Linux capabilities dropped.
+ADL refuses non-loopback plain HTTP URLs. Put the Relay behind HTTPS/WSS, keep its container port private to the reverse proxy, use a strong administrator token, and set rate limits. Persist `/data`, restrict its backups, and protect both the access state and audit log. The supplied Caddy deployment runs the Relay read-only apart from `/data`, as an unprivileged user with all Linux capabilities dropped.
 
-The current relay has no persistent database, account system, malware scanning, moderation, or distributed abuse defense. Operate it for a small invited test group, not as an unrestricted public service.
+The current Relay has a small file-backed invitation/user registry, not a multi-tenant identity provider. It has no password recovery, federated login, malware scanning, moderation, or distributed abuse defense. Operate it for a small invited test group, not as an unrestricted public service.
 
 ## Identity and trust limitations
 
@@ -69,4 +72,4 @@ The `sender` field is self-asserted and not cryptographically authenticated. End
 
 ## Reporting
 
-For this private alpha, report a vulnerability privately to the repository owner. Do not include active invitation URLs, credentials, private task text, or sensitive patches in an issue.
+Report a vulnerability privately to the repository owner. Do not include active invitation URLs, credentials, private task text, or sensitive patches in an issue.
