@@ -1,6 +1,6 @@
 # Security model
 
-Version `0.2.0-alpha.1` is intended for controlled tests between trusted collaborators on non-sensitive repositories. Do not give links to anonymous users, execute tasks from people you do not trust, or treat this as a hardened sandbox for hostile code.
+Version `0.2.0-alpha.2` is intended for controlled tests between trusted collaborators on non-sensitive repositories. Do not give links to anonymous users, execute tasks from people you do not trust, or treat this as a hardened sandbox for hostile code.
 
 ## What the alpha protects
 
@@ -32,6 +32,7 @@ The relay is currently in-memory. Its rate limiter and replay state do not survi
 - each task uses a detached temporary Git worktree at committed `HEAD`;
 - uncommitted owner changes are excluded and the original checkout is not modified;
 - validation commands are chosen by the owner when sharing, never by the remote sender;
+- edit requests that produce no patch and owner validations that exit nonzero fail closed;
 - child processes inherit an environment allowlist rather than the complete environment;
 - Codex runs ephemerally, ignores user config, uses `read-only` or `workspace-write` sandboxing, disables interactive escalation, and does not enable web search;
 - Claude runs in safe mode without session persistence and receives only explicit file tools; Bash and web tools are not granted.

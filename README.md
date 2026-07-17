@@ -25,6 +25,7 @@ sender Codex/Claude -> ADL CLI or MCP -> HTTPS relay <- owner gateway -> owner C
 - AES-256-GCM end-to-end encryption with HKDF-separated relay and content keys
 - expiring, revocable, task-counted capability links
 - per-task approval, permission checks at relay and gateway, and owner-defined validation
+- edit tasks fail closed when no patch is produced, and nonzero owner validations fail the task
 - execution timeout, output/patch limits, request rate limiting, and optional relay registration token
 - reconnect, encrypted offline queueing, and idempotent retry protection
 - hash-chained local JSONL audit log without task or patch plaintext
@@ -40,7 +41,7 @@ npm run check
 npm test
 npm run build
 npm pack
-npm install -g ./agent-delegation-link-0.2.0-alpha.1.tgz
+npm install -g ./agent-delegation-link-0.2.0-alpha.2.tgz
 ```
 
 ## Local smoke test

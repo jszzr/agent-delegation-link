@@ -24,11 +24,11 @@ The relay is in-memory. Do not restart it during a test, or existing links/tasks
 From a private alpha release asset or a source checkout:
 
 ```bash
-npm install -g ./agent-delegation-link-0.2.0-alpha.1.tgz
+npm install -g ./agent-delegation-link-0.2.0-alpha.2.tgz
 adl --version
 ```
 
-Expected version: `0.2.0-alpha.1`.
+Expected version: `0.2.0-alpha.2`.
 
 For agent-native sending, configure one or both clients:
 

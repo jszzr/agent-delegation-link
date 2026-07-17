@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ClaudeCliAdapter, CodexCliAdapter } from "../src/adapters.js";
+import { safeAgentEnvironment } from "../src/process.js";
 
 describe("coding-agent CLI adapters", () => {
   let directory: string;
@@ -75,5 +76,25 @@ describe("coding-agent CLI adapters", () => {
     expect(args).toContain("--no-session-persistence");
     expect(args).toContain("--permission-mode\nplan");
     expect(args).toContain("--tools\nRead,Glob,Grep");
+  });
+
+  it("preserves owner-configured proxy and custom CA routing", () => {
+    const keys = ["HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE"] as const;
+    const originals = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.HTTPS_PROXY = "http://127.0.0.1:39091";
+      process.env.NO_PROXY = "localhost,127.0.0.1";
+      process.env.SSL_CERT_FILE = "/tmp/owner-ca.pem";
+      const environment = safeAgentEnvironment();
+      expect(environment.HTTPS_PROXY).toBe("http://127.0.0.1:39091");
+      expect(environment.NO_PROXY).toBe("localhost,127.0.0.1");
+      expect(environment.SSL_CERT_FILE).toBe("/tmp/owner-ca.pem");
+    } finally {
+      for (const key of keys) {
+        const value = originals[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 });

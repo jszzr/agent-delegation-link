@@ -261,6 +261,9 @@ export class DelegationGateway {
         request.requestedPermissions.includes("test") ? this.options.validationCommands ?? [] : [],
         { maxArtifactBytes: this.policy.maxArtifactBytes, deadline }
       );
+      if (request.requestedPermissions.includes("edit") && collected.changedFiles.length === 0) {
+        throw new Error("Agent produced no changes for a task that requested edit capability");
+      }
       const result: TaskResult = {
         summary: execution.summary.slice(0, 100_000),
         patch: collected.patch,

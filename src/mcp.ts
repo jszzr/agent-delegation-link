@@ -18,7 +18,7 @@ function toolError(error: unknown) {
 }
 
 export function createMcpServer(): McpServer {
-  const server = new McpServer({ name: "agent-delegation-link", version: "0.2.0-alpha.1" });
+  const server = new McpServer({ name: "agent-delegation-link", version: "0.2.0-alpha.2" });
   server.registerTool(
     "delegate_task",
     {

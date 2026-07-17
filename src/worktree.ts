@@ -47,15 +47,19 @@ export class TemporaryWorktree {
         maxOutputBytes: 50_000,
         timeoutMs: remaining
       });
-      validations.push({
+      const validation = {
         command,
         exitCode: result.exitCode,
         stdout: result.stdout,
         stderr: result.stderr,
         timedOut: result.timedOut,
         outputTruncated: result.stdoutTruncated || result.stderrTruncated
-      });
+      };
+      validations.push(validation);
       if (result.timedOut) throw new Error(`Validation timed out: ${command}`);
+      if (result.exitCode !== 0) {
+        throw new Error(`Owner validation failed with exit code ${result.exitCode}: ${command}`);
+      }
     }
     const intentResult = await runProcess("git", ["add", "--intent-to-add", "--", "."], {
       cwd: this.directory,

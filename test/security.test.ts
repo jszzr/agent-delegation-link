@@ -165,6 +165,87 @@ describe("security boundaries", () => {
     }
   });
 
+  it("fails edit tasks when the agent returns no changes", async () => {
+    const repo = await fixtureRepo();
+    const relay = new RelayServer();
+    const { origin } = await relay.start();
+    const adapter: AgentAdapter = {
+      name: "no-op",
+      async execute() {
+        return { summary: "unable to make the requested change" };
+      }
+    };
+    const gateway = new DelegationGateway({
+      relayOrigin: origin,
+      repoPath: repo,
+      adapter,
+      policy: {
+        label: "no-op-test",
+        agent: "fake",
+        permissions: ["read", "edit"],
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        maxTasks: 1,
+        approval: "auto_within_scope",
+        maxTaskDurationSeconds: 60,
+        maxArtifactBytes: 1_000_000
+      }
+    });
+    try {
+      const invitation = (await gateway.start()).invitationUrl;
+      const submitted = await submitTask(invitation, {
+        goal: "make a required edit",
+        sender: "test",
+        requestedPermissions: ["read", "edit"],
+        constraints: [],
+        acceptanceCriteria: []
+      });
+      const task = await waitForTask(invitation, submitted.taskId, { timeoutMs: 5_000, pollMs: 20 });
+      expect(task.status).toBe("failed");
+      expect(task.error).toContain("no changes");
+    } finally {
+      await gateway.stop();
+      await relay.stop();
+    }
+  });
+
+  it("fails tasks when an owner validation command exits nonzero", async () => {
+    const repo = await fixtureRepo();
+    const relay = new RelayServer();
+    const { origin } = await relay.start();
+    const gateway = new DelegationGateway({
+      relayOrigin: origin,
+      repoPath: repo,
+      adapter: new FakeAdapter(),
+      validationCommands: ["exit 7"],
+      policy: {
+        label: "validation-failure-test",
+        agent: "fake",
+        permissions: ["read", "edit", "test"],
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        maxTasks: 1,
+        approval: "auto_within_scope",
+        maxTaskDurationSeconds: 60,
+        maxArtifactBytes: 1_000_000
+      }
+    });
+    try {
+      const invitation = (await gateway.start()).invitationUrl;
+      const submitted = await submitTask(invitation, {
+        goal: "produce a patch that fails validation",
+        sender: "test",
+        requestedPermissions: ["read", "edit", "test"],
+        constraints: [],
+        acceptanceCriteria: []
+      });
+      const task = await waitForTask(invitation, submitted.taskId, { timeoutMs: 5_000, pollMs: 20 });
+      expect(task.status).toBe("failed");
+      expect(task.error).toContain("Owner validation failed with exit code 7");
+    } finally {
+      await gateway.stop();
+      await relay.stop();
+    }
+  });
+
   it("rate limits repeated requests from one source", async () => {
     const relay = new RelayServer();
     const { origin } = await relay.start({ maxRequestsPerMinute: 2 });

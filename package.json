@@ -1,6 +1,6 @@
 {
   "name": "agent-delegation-link",
-  "version": "0.2.0-alpha.1",
+  "version": "0.2.0-alpha.2",
   "description": "Task-scoped delegation links for user-owned Codex and Claude Code agents.",
   "type": "module",
   "private": true,

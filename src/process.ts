@@ -12,7 +12,8 @@ export interface ProcessResult {
 export function safeAgentEnvironment(): NodeJS.ProcessEnv {
   const allowed = [
     "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "TERM", "CODEX_HOME",
-    "CLAUDE_CONFIG_DIR"
+    "CLAUDE_CONFIG_DIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy",
+    "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"
   ];
   return Object.fromEntries(
     allowed.flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]]))

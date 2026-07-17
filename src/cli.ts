@@ -13,7 +13,7 @@ import { startMcpServer } from "./mcp.js";
 import { agentKindSchema, type GrantPolicy, type StoredTask, type TaskRequest } from "./protocol.js";
 import { RelayServer } from "./relay.js";
 
-const VERSION = "0.2.0-alpha.1";
+const VERSION = "0.2.0-alpha.2";
 const program = new Command()
   .name("adl")
   .description("Encrypted task-scoped delegation links for Codex and Claude Code")
