@@ -35,6 +35,7 @@ The relay is currently in-memory. Its rate limiter and replay state do not survi
 - edit requests that produce no patch and owner validations that exit nonzero fail closed;
 - child processes inherit an environment allowlist rather than the complete environment;
 - Codex runs ephemerally, ignores user config, uses `read-only` or `workspace-write` sandboxing, disables interactive escalation, and does not enable web search;
+- Linux owners must provide a working Bubblewrap/AppArmor user-namespace profile; do not bypass a sandbox initialization failure with `danger-full-access`;
 - Claude runs in safe mode without session persistence and receives only explicit file tools; Bash and web tools are not granted.
 
 The worktree is edit isolation, not a complete OS security boundary. The CLIs still need local authentication, and Claude's file-tool restrictions are not equivalent to a container or VM. A compromised agent runtime or undiscovered CLI escape may access more of the host than intended. Use a disposable OS account or VM for higher-risk testing.

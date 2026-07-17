@@ -30,6 +30,19 @@ adl --version
 
 Expected version: `0.2.0-alpha.2`.
 
+If the repository owner runs Codex on Linux, verify `codex doctor` before sharing. Codex requires a working Bubblewrap user namespace for `workspace-write` isolation. On Ubuntu 24.04, install and load the dedicated AppArmor profile rather than disabling AppArmor's global unprivileged-user-namespace restriction:
+
+```bash
+sudo apt update
+sudo apt install bubblewrap apparmor-profiles apparmor-utils
+sudo install -m 0644 \
+  /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+  /etc/apparmor.d/bwrap-userns-restrict
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+```
+
+If Codex reports `bwrap`, `RTM_NEWADDR`, or user-namespace errors, stop the test and fix the host sandbox. Do not work around the error with `danger-full-access` on a machine that contains credentials or sensitive repositories.
+
 For agent-native sending, configure one or both clients:
 
 ```bash
